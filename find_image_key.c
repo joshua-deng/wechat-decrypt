@@ -1,238 +1,242 @@
 /*
- * find_image_key.c — macOS V2 image AES key scanner
+ * find_image_key.c — WeChat V2 image key continuous scanner (macOS)
  *
- * Scans WeChat process memory for the V2 image decryption key.
- * The key is only transiently present in memory while WeChat is
- * actively displaying images — run this IMMEDIATELY after viewing
- * images in WeChat (e.g. Moments).
+ * Discovers all unique V2 encryption patterns from the image cache,
+ * then continuously scans WeChat process memory to find AES keys.
+ * User just keeps browsing images in WeChat — the scanner catches
+ * keys as they transiently appear in memory.
+ *
+ * Uses multi-block CCCrypt: one key setup decrypts ALL unsolved
+ * patterns in a single call (~1.5 min per full scan with 20 patterns).
  *
  * Build:
  *   cc -O3 -o find_image_key find_image_key.c -framework Security
  *
  * Usage:
- *   sudo ./find_image_key                    # auto-find V2 files from config.json
- *   sudo ./find_image_key <ct_block_hex>     # manual CT block
- *
- * The key is printed as a hex string. If config.json exists, also
- * writes the key to the "image_key" field.
+ *   sudo ./find_image_key              # auto-discover from config.json
+ *   sudo ./find_image_key <image_dir>  # explicit image directory
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <signal.h>
+#include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 #include <CommonCrypto/CommonCryptor.h>
 
-#define MAX_PATH 4096
-#define V2_MAGIC "\x07\x08V2\x08\x07"
+#define MAX_PATH    4096
+#define MAX_PATTERNS 64
+#define V2_MAGIC    "\x07\x08V2\x08\x07"
 #define V2_MAGIC_LEN 6
+#define REGION_MAX  (200 * 1024 * 1024)
+
+/* ---- Image magic bytes (3-byte prefixes) ---- */
+static const unsigned char MAGIC_JPEG[3] = {0xFF, 0xD8, 0xFF};
+static const unsigned char MAGIC_PNG[3]  = {0x89, 0x50, 0x4E};
+static const unsigned char MAGIC_GIF[3]  = {0x47, 0x49, 0x46};
+static const unsigned char MAGIC_RIFF[3] = {0x52, 0x49, 0x46};
+
+static int is_image_magic(const unsigned char *pt) {
+    return memcmp(pt, MAGIC_JPEG, 3) == 0 ||
+           memcmp(pt, MAGIC_PNG, 3) == 0 ||
+           memcmp(pt, MAGIC_GIF, 3) == 0 ||
+           memcmp(pt, MAGIC_RIFF, 3) == 0;
+}
+
+/* ---- Pattern tracking ---- */
+typedef struct {
+    unsigned char ct[16];           /* CT block 0 (first 16 encrypted bytes) */
+    unsigned char key[16];          /* found AES key */
+    int           solved;
+    int           file_count;       /* how many .dat files use this pattern */
+    char          sample_path[MAX_PATH];
+} pattern_t;
+
+static pattern_t patterns[MAX_PATTERNS];
+static int       npatterns = 0;
+static int       total_v2_files = 0;
+
+/* ---- Graceful shutdown ---- */
+static volatile sig_atomic_t stop_flag = 0;
+static void sigint_handler(int sig) { (void)sig; stop_flag = 1; }
 
 /* ---- Utility ---- */
-
-static int hex2bytes(const char *hex, unsigned char *out, int maxlen) {
-    int len = 0;
-    while (*hex && *(hex + 1) && len < maxlen) {
-        unsigned int b;
-        sscanf(hex, "%2x", &b);
-        out[len++] = (unsigned char)b;
-        hex += 2;
+static void bytes2hex(const unsigned char *d, int n, char *out) {
+    for (int i = 0; i < n; i++) sprintf(out + i*2, "%02x", d[i]);
+    out[n*2] = '\0';
+}
+static int hex2bytes(const char *h, unsigned char *o, int max) {
+    int n = 0;
+    while (*h && *(h+1) && n < max) {
+        unsigned int b; sscanf(h, "%2x", &b);
+        o[n++] = (unsigned char)b; h += 2;
     }
-    return len;
+    return n;
 }
 
-static void bytes2hex(const unsigned char *data, int len, char *out) {
-    for (int i = 0; i < len; i++)
-        sprintf(out + i * 2, "%02x", data[i]);
-    out[len * 2] = '\0';
-}
-
-/* ---- Config.json parsing (minimal) ---- */
-
-/* Extract a JSON string value for a given key from a buffer */
+/* Minimal JSON string extractor */
 static int json_get_string(const char *json, const char *key,
-                           char *value, int maxlen) {
-    char pattern[256];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
+                           char *val, int maxlen) {
+    char pat[256];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
     if (!p) return 0;
-    p = strchr(p + strlen(pattern), '"');
+    p = strchr(p + strlen(pat), '"');
     if (!p) return 0;
-    p++; /* skip opening quote */
+    p++;
     const char *end = strchr(p, '"');
-    if (!end) return 0;
-    int len = (int)(end - p);
-    if (len >= maxlen) len = maxlen - 1;
-    memcpy(value, p, len);
-    value[len] = '\0';
+    if (!end || (int)(end - p) >= maxlen) return 0;
+    memcpy(val, p, end - p);
+    val[end - p] = '\0';
     return 1;
 }
 
-/* Write image_key into config.json */
-static void config_write_image_key(const char *config_path, const char *key_hex) {
-    FILE *f = fopen(config_path, "r");
-    if (!f) return;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(sz + 256);
-    size_t rd = fread(buf, 1, sz, f);
-    buf[rd] = '\0';
-    fclose(f);
-
-    /* Find "image_key": "..." and replace the value */
-    char *p = strstr(buf, "\"image_key\"");
-    if (p) {
-        /* Find the value string */
-        char *q = strchr(p + 11, '"');
-        if (q) {
-            q++; /* start of old value */
-            char *r = strchr(q, '"');
-            if (r) {
-                /* Build new file content */
-                FILE *out = fopen(config_path, "w");
-                if (out) {
-                    fwrite(buf, 1, q - buf, out);
-                    fputs(key_hex, out);
-                    fputs(r, out); /* rest including closing quote */
-                    fclose(out);
-                    printf("  Updated %s with image_key\n", config_path);
-                    free(buf);
-                    return;
-                }
-            }
-        }
-    }
-
-    /* No image_key field found — insert before last } */
-    char *last_brace = strrchr(buf, '}');
-    if (last_brace) {
-        FILE *out = fopen(config_path, "w");
-        if (out) {
-            fwrite(buf, 1, last_brace - buf, out);
-            fprintf(out, ",\n    \"image_key\": \"%s\"\n}", key_hex);
-            fclose(out);
-            printf("  Updated %s with image_key\n", config_path);
-        }
-    }
-    free(buf);
+/* ---- Pattern discovery ---- */
+static int find_pattern_index(const unsigned char *ct) {
+    for (int i = 0; i < npatterns; i++)
+        if (memcmp(patterns[i].ct, ct, 16) == 0) return i;
+    return -1;
 }
 
-/* ---- V2 .dat file discovery ---- */
-
-static int find_v2_ct_block(const char *base_dir, unsigned char *ct_block) {
-    /* Walk the directory tree looking for V2 .dat files */
-    DIR *d = opendir(base_dir);
-    if (!d) return 0;
-
+static void discover_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return;
     struct dirent *ent;
     while ((ent = readdir(d))) {
         if (ent->d_name[0] == '.') continue;
-
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", base_dir, ent->d_name);
-
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         struct stat st;
         if (stat(path, &st) != 0) continue;
-
         if (S_ISDIR(st.st_mode)) {
-            if (find_v2_ct_block(path, ct_block)) {
-                closedir(d);
-                return 1;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            size_t nlen = strlen(ent->d_name);
-            if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".dat") != 0)
-                continue;
+            discover_dir(path);
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        size_t nlen = strlen(ent->d_name);
+        if (nlen < 5 || strcmp(ent->d_name + nlen - 4, ".dat") != 0) continue;
 
-            FILE *f = fopen(path, "rb");
-            if (!f) continue;
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        unsigned char hdr[31];
+        size_t rd = fread(hdr, 1, 31, f);
+        fclose(f);
+        if (rd < 31 || memcmp(hdr, V2_MAGIC, V2_MAGIC_LEN) != 0) continue;
 
-            unsigned char hdr[6];
-            if (fread(hdr, 1, 6, f) == 6 && memcmp(hdr, V2_MAGIC, 6) == 0) {
-                fseek(f, 15, SEEK_SET);
-                if (fread(ct_block, 1, 16, f) == 16) {
-                    char hex[33];
-                    bytes2hex(ct_block, 16, hex);
-                    printf("CT block: %s\n", hex);
-                    printf("From: ...%s\n\n",
-                           strlen(path) > 60 ? path + strlen(path) - 60 : path);
-                    fclose(f);
-                    closedir(d);
-                    return 1;
-                }
-            }
-            fclose(f);
+        unsigned char *ct = hdr + 15;
+        total_v2_files++;
+        int idx = find_pattern_index(ct);
+        if (idx >= 0) {
+            patterns[idx].file_count++;
+        } else if (npatterns < MAX_PATTERNS) {
+            memcpy(patterns[npatterns].ct, ct, 16);
+            patterns[npatterns].file_count = 1;
+            patterns[npatterns].solved = 0;
+            strncpy(patterns[npatterns].sample_path, path,
+                    sizeof(patterns[npatterns].sample_path) - 1);
+            npatterns++;
         }
     }
     closedir(d);
-    return 0;
+}
+
+/* Sort patterns by file_count descending */
+static int cmp_patterns(const void *a, const void *b) {
+    return ((pattern_t*)b)->file_count - ((pattern_t*)a)->file_count;
 }
 
 /* ---- Process discovery ---- */
-
-static int get_wechat_pids(pid_t *pids, int max_pids) {
+static int get_wechat_pids(pid_t *pids, int max) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t size = 0;
-    sysctl(mib, 4, NULL, &size, NULL, 0);
-    struct kinfo_proc *procs = malloc(size);
-    sysctl(mib, 4, procs, &size, NULL, 0);
-    int nprocs = (int)(size / sizeof(struct kinfo_proc));
-    int count = 0;
-    for (int i = 0; i < nprocs && count < max_pids; i++) {
+    size_t sz = 0;
+    sysctl(mib, 4, NULL, &sz, NULL, 0);
+    struct kinfo_proc *procs = malloc(sz);
+    sysctl(mib, 4, procs, &sz, NULL, 0);
+    int n = (int)(sz / sizeof(struct kinfo_proc)), cnt = 0;
+    for (int i = 0; i < n && cnt < max; i++)
         if (strstr(procs[i].kp_proc.p_comm, "WeChat"))
-            pids[count++] = procs[i].kp_proc.p_pid;
-    }
+            pids[cnt++] = procs[i].kp_proc.p_pid;
     free(procs);
-    return count;
+    return cnt;
 }
 
-/* ---- AES test ---- */
+/* ---- Verification: decrypt a sample file and check image magic ---- */
+static int verify_key(int pat_idx) {
+    pattern_t *p = &patterns[pat_idx];
+    FILE *f = fopen(p->sample_path, "rb");
+    if (!f) return 1; /* can't verify, assume ok */
 
-static inline int try_key(const unsigned char *key, const unsigned char *ct) {
-    unsigned char pt[16];
-    size_t moved = 0;
-    CCCryptorStatus st = CCCrypt(
-        kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode,
-        key, 16, NULL, ct, 16, pt, 16, &moved);
-    if (st != kCCSuccess) return 0;
-    /* FFD8FF + valid JPEG marker (E0-EF, DB, C0-C3, C4, FE, etc.) */
-    return (pt[0] == 0xFF && pt[1] == 0xD8 && pt[2] == 0xFF &&
-            (pt[3] >= 0xC0 || pt[3] == 0x00));
+    unsigned char hdr[15];
+    if (fread(hdr, 1, 15, f) != 15) { fclose(f); return 1; }
+    uint32_t aes_size;
+    memcpy(&aes_size, hdr + 6, 4);
+    uint32_t ct_size = ((aes_size + 15) / 16) * 16;
+    if (ct_size > 10 * 1024 * 1024) { fclose(f); return 1; }
+
+    unsigned char *ct = malloc(ct_size);
+    size_t rd = fread(ct, 1, ct_size, f);
+    fclose(f);
+    if (rd < ct_size) { free(ct); return 1; }
+
+    unsigned char *pt = malloc(ct_size);
+    size_t moved;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES128,
+        kCCOptionECBMode, p->key, 16, NULL,
+        ct, ct_size, pt, ct_size, &moved);
+    free(ct);
+
+    int ok = (st == kCCSuccess && moved >= 3 && is_image_magic(pt));
+    free(pt);
+    return ok;
 }
 
 /* ---- Memory scanning ---- */
 
-static int scan_pid(pid_t pid, const unsigned char *ct, unsigned char *found_key) {
+/*
+ * Multi-block scan: for each candidate key, decrypt ALL unsolved
+ * CT blocks in one CCCrypt call (ECB processes blocks independently).
+ */
+static int scan_pid(pid_t pid) {
     mach_port_t task;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS) {
-        printf("  PID %d: task_for_pid failed (%d)\n", pid, kr);
-        return 0;
-    }
+    if (kr != KERN_SUCCESS) return 0;
+
+    /* Build batch CT buffer for unsolved patterns */
+    int unsolved_idx[MAX_PATTERNS];
+    int n_unsolved = 0;
+    for (int i = 0; i < npatterns; i++)
+        if (!patterns[i].solved) unsolved_idx[n_unsolved++] = i;
+    if (n_unsolved == 0) return 0;
+
+    unsigned char *batch_ct = malloc(n_unsolved * 16);
+    unsigned char *batch_pt = malloc(n_unsolved * 16);
+    for (int i = 0; i < n_unsolved; i++)
+        memcpy(batch_ct + i*16, patterns[unsolved_idx[i]].ct, 16);
 
     mach_vm_address_t addr = 0;
-    mach_vm_size_t rsize = 0;
+    mach_vm_size_t rsize;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count;
     mach_port_t obj;
 
-    long regions = 0;
+    long regions = 0, found_this_pid = 0;
     long long total_bytes = 0, tests = 0;
 
-    while (1) {
+    while (!stop_flag) {
         count = VM_REGION_BASIC_INFO_COUNT_64;
         kr = mach_vm_region(task, &addr, &rsize, VM_REGION_BASIC_INFO_64,
                             (vm_region_info_t)&info, &count, &obj);
         if (kr != KERN_SUCCESS) break;
         regions++;
 
-        if ((info.protection & VM_PROT_READ) && rsize > 0 &&
-            rsize < 200 * 1024 * 1024) {
+        if ((info.protection & VM_PROT_READ) && rsize > 0 && rsize < REGION_MAX) {
             vm_offset_t data;
             mach_msg_type_number_t data_cnt;
             kr = mach_vm_read(task, addr, rsize, &data, &data_cnt);
@@ -240,52 +244,113 @@ static int scan_pid(pid_t pid, const unsigned char *ct, unsigned char *found_key
                 unsigned char *buf = (unsigned char *)data;
                 total_bytes += data_cnt;
 
-                /* Method 1: every 16-byte aligned position (raw binary) */
-                for (mach_msg_type_number_t j = 0; j + 16 <= data_cnt; j += 16) {
+                /* Method 1: every 16-byte aligned position (raw binary keys) */
+                for (mach_msg_type_number_t j = 0;
+                     j + 16 <= data_cnt && !stop_flag; j += 16) {
                     tests++;
-                    if (try_key(buf + j, ct)) {
-                        memcpy(found_key, buf + j, 16);
-                        char hex[33];
-                        bytes2hex(found_key, 16, hex);
-                        printf("\n==================================================\n");
-                        printf("*** FOUND KEY: %s ***\n", hex);
-                        printf("  ASCII: ");
-                        for (int k = 0; k < 16; k++)
-                            putchar((buf[j+k] >= 0x20 && buf[j+k] < 0x7f)
-                                        ? buf[j+k] : '.');
-                        printf("\n  PID %d, addr=0x%llx+0x%x\n", pid, addr, j);
-                        printf("==================================================\n");
-                        mach_vm_deallocate(mach_task_self(), data, data_cnt);
-                        return 1;
+                    size_t moved;
+                    CCCryptorStatus st = CCCrypt(
+                        kCCDecrypt, kCCAlgorithmAES128, kCCOptionECBMode,
+                        buf + j, 16, NULL,
+                        batch_ct, n_unsolved * 16,
+                        batch_pt, n_unsolved * 16, &moved);
+                    if (st != kCCSuccess) continue;
+
+                    for (int p = 0; p < n_unsolved; p++) {
+                        if (is_image_magic(batch_pt + p*16)) {
+                            int idx = unsolved_idx[p];
+                            memcpy(patterns[idx].key, buf + j, 16);
+                            patterns[idx].solved = 1;
+
+                            char kh[33]; bytes2hex(buf + j, 16, kh);
+                            char ch[33]; bytes2hex(patterns[idx].ct, 16, ch);
+                            printf("\n  *** FOUND KEY: %s ***\n", kh);
+                            printf("      Pattern: %s (%d files)\n",
+                                   ch, patterns[idx].file_count);
+                            printf("      PID %d, addr=0x%llx+0x%x\n",
+                                   pid, addr, j);
+
+                            /* Cross-check: does this key solve OTHER patterns? */
+                            for (int q = 0; q < n_unsolved; q++) {
+                                if (q == p || patterns[unsolved_idx[q]].solved)
+                                    continue;
+                                unsigned char tpt[16];
+                                size_t tm;
+                                CCCrypt(kCCDecrypt, kCCAlgorithmAES128,
+                                    kCCOptionECBMode, buf + j, 16, NULL,
+                                    patterns[unsolved_idx[q]].ct, 16,
+                                    tpt, 16, &tm);
+                                if (is_image_magic(tpt)) {
+                                    int qi = unsolved_idx[q];
+                                    memcpy(patterns[qi].key, buf + j, 16);
+                                    patterns[qi].solved = 1;
+                                    char qch[33];
+                                    bytes2hex(patterns[qi].ct, 16, qch);
+                                    printf("      Also solves: %s (%d files)\n",
+                                           qch, patterns[qi].file_count);
+                                }
+                            }
+
+                            found_this_pid++;
+                            /* Rebuild batch for remaining unsolved */
+                            n_unsolved = 0;
+                            for (int i = 0; i < npatterns; i++)
+                                if (!patterns[i].solved)
+                                    unsolved_idx[n_unsolved++] = i;
+                            for (int i = 0; i < n_unsolved; i++)
+                                memcpy(batch_ct + i*16,
+                                       patterns[unsolved_idx[i]].ct, 16);
+                            if (n_unsolved == 0) goto done;
+                            break; /* restart block check with new batch */
+                        }
                     }
                 }
 
-                /* Method 2: ASCII [a-z0-9]{16+} patterns */
+                /* Method 2: ASCII [a-z0-9]{16+} at unaligned positions */
                 int run = 0, run_start = 0;
-                for (mach_msg_type_number_t j = 0; j <= data_cnt; j++) {
+                for (mach_msg_type_number_t j = 0;
+                     j <= data_cnt && !stop_flag; j++) {
                     int is_hex = (j < data_cnt) &&
-                        ((buf[j] >= 'a' && buf[j] <= 'z') ||
-                         (buf[j] >= '0' && buf[j] <= '9'));
+                        ((buf[j]>='a' && buf[j]<='z') ||
+                         (buf[j]>='0' && buf[j]<='9'));
                     if (is_hex) {
-                        if (run == 0) run_start = j;
+                        if (!run) run_start = j;
                         run++;
                     } else {
                         if (run >= 16) {
-                            for (int k = run_start; k + 16 <= run_start + run; k++) {
-                                /* Skip if this position was already tested as aligned */
-                                if (k % 16 == 0) continue;
+                            for (int k = run_start; k+16 <= run_start+run; k++) {
+                                if (k % 16 == 0) continue; /* already tested */
                                 tests++;
-                                if (try_key(buf + k, ct)) {
-                                    memcpy(found_key, buf + k, 16);
-                                    char hex[33];
-                                    bytes2hex(found_key, 16, hex);
-                                    printf("\n==================================================\n");
-                                    printf("*** FOUND KEY: %s ***\n", hex);
-                                    printf("  ASCII: %.32s\n", buf + run_start);
-                                    printf("  PID %d, addr=0x%llx+0x%x\n", pid, addr, k);
-                                    printf("==================================================\n");
-                                    mach_vm_deallocate(mach_task_self(), data, data_cnt);
-                                    return 1;
+                                size_t moved;
+                                CCCrypt(kCCDecrypt, kCCAlgorithmAES128,
+                                    kCCOptionECBMode, buf+k, 16, NULL,
+                                    batch_ct, n_unsolved*16,
+                                    batch_pt, n_unsolved*16, &moved);
+                                for (int p = 0; p < n_unsolved; p++) {
+                                    if (is_image_magic(batch_pt + p*16)) {
+                                        int idx = unsolved_idx[p];
+                                        memcpy(patterns[idx].key, buf+k, 16);
+                                        patterns[idx].solved = 1;
+                                        char kh[33]; bytes2hex(buf+k, 16, kh);
+                                        char ch[33];
+                                        bytes2hex(patterns[idx].ct, 16, ch);
+                                        printf("\n  *** FOUND KEY: %s ***\n", kh);
+                                        printf("      Pattern: %s (%d files)\n",
+                                               ch, patterns[idx].file_count);
+                                        printf("      ASCII context: %.32s\n",
+                                               buf + run_start);
+                                        found_this_pid++;
+                                        /* Rebuild */
+                                        n_unsolved = 0;
+                                        for (int i = 0; i < npatterns; i++)
+                                            if (!patterns[i].solved)
+                                                unsolved_idx[n_unsolved++] = i;
+                                        for (int i = 0; i < n_unsolved; i++)
+                                            memcpy(batch_ct + i*16,
+                                                patterns[unsolved_idx[i]].ct, 16);
+                                        if (n_unsolved == 0) goto done;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -293,122 +358,221 @@ static int scan_pid(pid_t pid, const unsigned char *ct, unsigned char *found_key
                     }
                 }
 
+                done:
                 mach_vm_deallocate(mach_task_self(), data, data_cnt);
+                if (n_unsolved == 0) break;
             }
         }
-
         addr += rsize;
         if (regions % 500 == 0) {
             printf("  [%ld regions, %lld MB, %lld tests]\r",
-                   regions, total_bytes / (1024 * 1024), tests);
+                   regions, total_bytes/(1024*1024), tests);
             fflush(stdout);
         }
     }
 
-    printf("  PID %d: %ld regions, %lld MB, %lld tests          \n",
-           pid, regions, total_bytes / (1024 * 1024), tests);
-    return 0;
+    printf("  PID %d: %ld regions, %lld MB, %lld tests, %ld keys found     \n",
+           pid, regions, total_bytes/(1024*1024), tests, found_this_pid);
+
+    free(batch_ct);
+    free(batch_pt);
+    return (int)found_this_pid;
+}
+
+/* ---- Save results ---- */
+static void save_keys(const char *dir) {
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s/image_keys.json", dir);
+
+    int solved = 0;
+    for (int i = 0; i < npatterns; i++)
+        if (patterns[i].solved) solved++;
+    if (solved == 0) return;
+
+    FILE *f = fopen(path, "w");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", path); return; }
+
+    fprintf(f, "{\n");
+    int first = 1;
+    for (int i = 0; i < npatterns; i++) {
+        if (!patterns[i].solved) continue;
+        char ct_hex[33], key_hex[33];
+        bytes2hex(patterns[i].ct, 16, ct_hex);
+        bytes2hex(patterns[i].key, 16, key_hex);
+        fprintf(f, "%s    \"%s\": \"%s\"",
+                first ? "" : ",\n", ct_hex, key_hex);
+        first = 0;
+    }
+    fprintf(f, "\n}\n");
+    fclose(f);
+    printf("\nSaved %d keys to %s\n", solved, path);
 }
 
 /* ---- Main ---- */
-
 int main(int argc, char *argv[]) {
-    unsigned char ct_block[16];
-    int have_ct = 0;
+    signal(SIGINT, sigint_handler);
 
-    printf("=== WeChat V2 Image Key Scanner (macOS) ===\n\n");
-
+    printf("=== WeChat V2 Image Key Scanner ===\n\n");
     if (getuid() != 0) {
-        fprintf(stderr, "ERROR: Run with sudo!\n");
-        return 1;
+        fprintf(stderr, "ERROR: Run with sudo!\n"); return 1;
     }
 
-    /* Try to get CT block from argument */
-    if (argc >= 2) {
-        if (hex2bytes(argv[1], ct_block, 16) == 16) {
-            char hex[33];
-            bytes2hex(ct_block, 16, hex);
-            printf("CT block (from arg): %s\n\n", hex);
-            have_ct = 1;
-        }
-    }
-
-    /* Try to read config.json for image_dir */
-    char config_path[MAX_PATH];
-    char db_dir[MAX_PATH] = "";
-
-    /* Find config.json relative to executable */
-    const char *exe = argv[0];
-    const char *last_slash = strrchr(exe, '/');
+    /* Determine image directory */
+    char image_dir[MAX_PATH] = "";
+    char exe_dir[MAX_PATH] = ".";
+    const char *last_slash = strrchr(argv[0], '/');
     if (last_slash) {
-        int dir_len = (int)(last_slash - exe);
-        snprintf(config_path, sizeof(config_path), "%.*s/config.json", dir_len, exe);
+        int len = (int)(last_slash - argv[0]);
+        snprintf(exe_dir, sizeof(exe_dir), "%.*s", len, argv[0]);
+    }
+
+    if (argc >= 2) {
+        strncpy(image_dir, argv[1], sizeof(image_dir) - 1);
     } else {
-        strcpy(config_path, "config.json");
-    }
-
-    FILE *cf = fopen(config_path, "r");
-    if (cf) {
-        fseek(cf, 0, SEEK_END);
-        long sz = ftell(cf);
-        fseek(cf, 0, SEEK_SET);
-        char *json = malloc(sz + 1);
-        fread(json, 1, sz, cf);
-        json[sz] = '\0';
-        fclose(cf);
-        json_get_string(json, "db_dir", db_dir, sizeof(db_dir));
-        free(json);
-    }
-
-    /* Auto-discover CT block from V2 .dat files */
-    if (!have_ct && db_dir[0]) {
-        /* Image cache is at sibling "msg" directory of db_storage */
-        char image_dir[MAX_PATH];
-        char *last = strrchr(db_dir, '/');
-        if (!last) last = strrchr(db_dir, '\\');
-        if (last) {
-            int plen = (int)(last - db_dir);
-            snprintf(image_dir, sizeof(image_dir), "%.*s/msg", plen, db_dir);
-        } else {
-            snprintf(image_dir, sizeof(image_dir), "%s/../msg", db_dir);
-        }
-        printf("Scanning for V2 files in: %s\n", image_dir);
-        have_ct = find_v2_ct_block(image_dir, ct_block);
-    }
-
-    if (!have_ct) {
-        fprintf(stderr, "ERROR: No V2 .dat file found.\n");
-        fprintf(stderr, "Usage: sudo %s [ct_block_hex]\n", argv[0]);
-        fprintf(stderr, "  or configure db_dir in config.json\n");
-        return 1;
-    }
-
-    /* Find WeChat processes */
-    pid_t pids[64];
-    int npids = get_wechat_pids(pids, 64);
-    if (npids == 0) {
-        fprintf(stderr, "ERROR: No WeChat processes found!\n");
-        return 1;
-    }
-    printf("WeChat processes: %d PIDs\n\n", npids);
-
-    /* Scan all processes */
-    unsigned char found_key[16];
-    for (int i = 0; i < npids; i++) {
-        printf("Scanning PID %d...\n", pids[i]);
-        if (scan_pid(pids[i], ct_block, found_key)) {
-            char key_hex[33];
-            bytes2hex(found_key, 16, key_hex);
-            printf("\nYour V2 image key: %s\n", key_hex);
-
-            /* Update config.json */
-            config_write_image_key(config_path, key_hex);
-            return 0;
+        /* Read config.json */
+        char cfg_path[MAX_PATH];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", exe_dir);
+        FILE *cf = fopen(cfg_path, "r");
+        if (cf) {
+            fseek(cf, 0, SEEK_END);
+            long sz = ftell(cf);
+            fseek(cf, 0, SEEK_SET);
+            char *json = malloc(sz + 1);
+            fread(json, 1, sz, cf);
+            json[sz] = '\0';
+            fclose(cf);
+            char db_dir[MAX_PATH];
+            if (json_get_string(json, "db_dir", db_dir, sizeof(db_dir))) {
+                char *s = strrchr(db_dir, '/');
+                if (!s) s = strrchr(db_dir, '\\');
+                if (s) {
+                    int plen = (int)(s - db_dir);
+                    snprintf(image_dir, sizeof(image_dir),
+                             "%.*s/msg", plen, db_dir);
+                }
+            }
+            free(json);
         }
     }
 
-    printf("\n*** KEY NOT FOUND ***\n");
-    printf("TIP: View images in WeChat Moments, then run IMMEDIATELY!\n");
-    printf("The key only exists in memory while WeChat is displaying images.\n");
-    return 1;
+    if (image_dir[0] == '\0') {
+        fprintf(stderr, "ERROR: Cannot determine image directory.\n");
+        fprintf(stderr, "Usage: sudo %s [image_dir]\n", argv[0]);
+        return 1;
+    }
+
+    /* Phase 1: Discover patterns */
+    printf("Discovering encryption patterns in:\n  %s\n\n", image_dir);
+    discover_dir(image_dir);
+    if (npatterns == 0) {
+        fprintf(stderr, "No V2 .dat files found!\n"); return 1;
+    }
+    qsort(patterns, npatterns, sizeof(pattern_t), cmp_patterns);
+
+    int total_covered = 0;
+    printf("Found %d patterns across %d V2 files:\n", npatterns, total_v2_files);
+    for (int i = 0; i < npatterns; i++) {
+        char ch[33]; bytes2hex(patterns[i].ct, 16, ch);
+        printf("  #%-2d %s  (%d files)\n", i+1, ch, patterns[i].file_count);
+        total_covered += patterns[i].file_count;
+    }
+    if (total_covered < total_v2_files)
+        printf("  ... and %d files in overflow patterns\n",
+               total_v2_files - total_covered);
+
+    /* Phase 2: Continuous scanning */
+    printf("\nScanning WeChat memory — keep browsing images! (Ctrl+C to stop)\n");
+    int round = 0;
+    while (!stop_flag) {
+        int unsolved = 0;
+        for (int i = 0; i < npatterns; i++)
+            if (!patterns[i].solved) unsolved++;
+        if (unsolved == 0) break;
+
+        round++;
+        pid_t pids[64];
+        int npids = get_wechat_pids(pids, 64);
+        if (npids == 0) {
+            printf("  No WeChat processes found, waiting...\n");
+            sleep(3);
+            continue;
+        }
+
+        printf("\n--- Round %d: %d unsolved / %d total, %d PIDs ---\n",
+               round, unsolved, npatterns, npids);
+
+        int found_round = 0;
+        for (int i = 0; i < npids && !stop_flag; i++) {
+            found_round += scan_pid(pids[i]);
+        }
+
+        unsolved = 0;
+        int solved_files = 0;
+        for (int i = 0; i < npatterns; i++) {
+            if (patterns[i].solved) solved_files += patterns[i].file_count;
+            else unsolved++;
+        }
+
+        if (found_round > 0) {
+            printf("\n  Progress: %d/%d patterns solved (%d/%d files)\n",
+                   npatterns - unsolved, npatterns,
+                   solved_files, total_v2_files);
+            /* Verify newly found keys */
+            for (int i = 0; i < npatterns; i++) {
+                if (patterns[i].solved && !verify_key(i)) {
+                    char kh[33]; bytes2hex(patterns[i].key, 16, kh);
+                    printf("  WARNING: Key %s failed verification (false positive?)\n", kh);
+                    patterns[i].solved = 0;
+                    memset(patterns[i].key, 0, 16);
+                }
+            }
+            /* Save after each find */
+            save_keys(exe_dir);
+        }
+
+        if (unsolved > 0 && !stop_flag) {
+            printf("  Keep browsing images in different chats...\n");
+            sleep(1);
+        }
+    }
+
+    /* Phase 3: Summary */
+    save_keys(exe_dir);
+
+    int solved = 0, solved_files = 0;
+    for (int i = 0; i < npatterns; i++) {
+        if (patterns[i].solved) {
+            solved++;
+            solved_files += patterns[i].file_count;
+        }
+    }
+
+    printf("\n==================================================\n");
+    if (solved == npatterns) {
+        printf("ALL %d patterns solved! (%d files)\n", npatterns, total_v2_files);
+    } else {
+        printf("%d/%d patterns solved (%d/%d files)\n",
+               solved, npatterns, solved_files, total_v2_files);
+        printf("Unsolved:\n");
+        for (int i = 0; i < npatterns; i++) {
+            if (patterns[i].solved) continue;
+            char ch[33]; bytes2hex(patterns[i].ct, 16, ch);
+            printf("  %s (%d files)\n", ch, patterns[i].file_count);
+        }
+    }
+
+    /* Count unique keys */
+    int unique_keys = 0;
+    for (int i = 0; i < npatterns; i++) {
+        if (!patterns[i].solved) continue;
+        int dup = 0;
+        for (int j = 0; j < i; j++)
+            if (patterns[j].solved &&
+                memcmp(patterns[i].key, patterns[j].key, 16) == 0) { dup = 1; break; }
+        if (!dup) unique_keys++;
+    }
+    printf("%d unique key(s) found.\n", unique_keys);
+    printf("==================================================\n");
+
+    return (solved > 0) ? 0 : 1;
 }

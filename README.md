@@ -81,37 +81,40 @@ sudo python3 decrypt_db.py      # macOS (无 Full Disk Access 时需要 sudo)
 
 ### 4. 解密图片缓存 (V2 格式)
 
-微信 4.0 的图片缓存使用 V2 加密格式 (AES-128-ECB + XOR)。图片密钥是**瞬时的**——仅在微信正在显示图片时才存在于内存中。
+微信 4.0 的图片缓存使用 V2 加密格式 (AES-128-ECB + XOR)。图片密钥是**瞬时的**——仅在微信正在显示图片时才存在于内存中。同一设备上通常存在多个密钥（对应不同来源的图片），扫描器支持**持续扫描 + 多密钥采集**。
 
-#### 编译图片密钥扫描器 (macOS)
+#### 编译 (macOS)
 
 ```bash
 cc -O3 -o find_image_key find_image_key.c -framework Security
+cc -O3 -o decrypt_images decrypt_images.c -framework Security
 ```
 
 #### 提取图片密钥
 
-1. 在微信中打开朋友圈，**点击查看几张图片**
-2. **立刻**运行：
+扫描器启动后会持续运行，你只需在微信中**浏览不同聊天的图片**，扫描器自动捕获密钥：
 
 ```bash
 sudo ./find_image_key
 ```
 
-密钥会自动保存到 `config.json` 的 `image_key` 字段。
+扫描器会：
+1. 自动发现所有 V2 加密模式（CT block 分组）
+2. 持续扫描微信进程内存，捕获活跃密钥
+3. 找到密钥后自动验证（解密样本文件检查图片格式）
+4. 所有模式解密后自动结束（或 Ctrl+C 保存已发现的密钥）
 
-> **注意**: 密钥仅在查看图片后的几秒内存在于内存中，需要多试几次。
+密钥映射保存到 `image_keys.json`（CT block → AES key）。
 
-#### 编译并运行图片解密器
+#### 运行图片解密器
 
 ```bash
-cc -O3 -o decrypt_images decrypt_images.c -framework Security
-sudo ./decrypt_images
+./decrypt_images
 ```
 
-解密后的图片保存在 `decrypted_images/` 目录。
+解密器自动加载 `image_keys.json` 进行多密钥解密，也兼容 `config.json` 中的单个 `image_key`。解密后的图片保存在 `decrypted_images/` 目录。
 
-> **已知限制**: 同一设备上可能存在多个 V2 密钥（对应不同来源的图片缓存），单次扫描只能获取当前活跃的密钥。
+> **提示**: 如果 `no_key` 数量较多，再次运行 `find_image_key` 并浏览更多图片来采集更多密钥。
 
 ### 5. 实时消息监听
 
@@ -196,8 +199,9 @@ claude mcp add wechat -- sudo python3 /path/to/wechat-decrypt/mcp_server.py
 | `monitor_web.py` | 实时消息监听 (Web UI + SSE) |
 | `monitor.py` | 实时消息监听 (命令行) |
 | `latency_test.py` | 延迟测量诊断工具 |
-| `find_image_key.c` | V2 图片密钥内存扫描器 (macOS, C + CommonCrypto) |
-| `decrypt_images.c` | V2 图片批量解密器 (macOS, C + CommonCrypto) |
+| `find_image_key.c` | V2 图片密钥持续扫描器 — 多模式自动采集 (macOS, C) |
+| `decrypt_images.c` | V2 图片多密钥批量解密器 (macOS, C) |
+| `image_keys.json` | 图片密钥映射 (CT block → AES key)，由 find_image_key 生成 |
 
 ## 技术细节
 
