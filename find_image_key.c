@@ -37,17 +37,28 @@
 #define V2_MAGIC_LEN 6
 #define REGION_MAX  (200 * 1024 * 1024)
 
-/* ---- Image magic bytes (3-byte prefixes) ---- */
-static const unsigned char MAGIC_JPEG[3] = {0xFF, 0xD8, 0xFF};
-static const unsigned char MAGIC_PNG[3]  = {0x89, 0x50, 0x4E};
-static const unsigned char MAGIC_GIF[3]  = {0x47, 0x49, 0x46};
-static const unsigned char MAGIC_RIFF[3] = {0x52, 0x49, 0x46};
-
+/* ---- Strict image magic detection (16 bytes available from decrypted block) ---- */
 static int is_image_magic(const unsigned char *pt) {
-    return memcmp(pt, MAGIC_JPEG, 3) == 0 ||
-           memcmp(pt, MAGIC_PNG, 3) == 0 ||
-           memcmp(pt, MAGIC_GIF, 3) == 0 ||
-           memcmp(pt, MAGIC_RIFF, 3) == 0;
+    if (pt[0] == 0xFF && pt[1] == 0xD8 && pt[2] == 0xFF &&
+        pt[3] >= 0xC0 && pt[3] != 0xFF) {
+        /* JFIF: verify "JF" at offset 6 */
+        if (pt[3] == 0xE0) return (pt[6] == 'J' && pt[7] == 'F');
+        /* EXIF: verify "Ex" at offset 6 */
+        if (pt[3] == 0xE1) return (pt[6] == 'E' && pt[7] == 'x');
+        /* Other markers: verify length field is sane (big-endian, 2..32767) */
+        uint16_t len = ((uint16_t)pt[4] << 8) | pt[5];
+        return (len >= 2 && len < 0x8000);
+    }
+    /* PNG: full 8-byte signature */
+    if (pt[0]==0x89 && pt[1]==0x50 && pt[2]==0x4E && pt[3]==0x47 &&
+        pt[4]==0x0D && pt[5]==0x0A && pt[6]==0x1A && pt[7]==0x0A) return 1;
+    /* GIF: "GIF89a" or "GIF87a" */
+    if (pt[0]=='G' && pt[1]=='I' && pt[2]=='F' && pt[3]=='8' &&
+        (pt[4]=='9' || pt[4]=='7') && pt[5]=='a') return 1;
+    /* WebP: "RIFF....WEBP" */
+    if (pt[0]=='R' && pt[1]=='I' && pt[2]=='F' && pt[3]=='F' &&
+        pt[8]=='W' && pt[9]=='E' && pt[10]=='B' && pt[11]=='P') return 1;
+    return 0;
 }
 
 /* ---- Pattern tracking ---- */
@@ -167,7 +178,39 @@ static int get_wechat_pids(pid_t *pids, int max) {
     return cnt;
 }
 
-/* ---- Verification: decrypt a sample file and check image magic ---- */
+/* ---- Verification: decrypt sample file, validate JPEG marker chain ---- */
+
+/* Validate JPEG structure: check marker chain (SOI → markers → SOS/EOI) */
+static int verify_jpeg_chain(const unsigned char *data, size_t len) {
+    if (len < 4 || data[0] != 0xFF || data[1] != 0xD8) return 0;
+    size_t pos = 2;
+    int markers = 0;
+    while (pos + 4 <= len) {
+        if (data[pos] != 0xFF) return markers >= 2;
+        unsigned char m = data[pos + 1];
+        /* Skip fill bytes (FF FF...) */
+        if (m == 0xFF) { pos++; continue; }
+        if (m == 0x00) return 0; /* stuffed byte outside scan = invalid */
+        if (m == 0xD9) return markers >= 1; /* EOI */
+        if (m == 0xDA) return markers >= 1; /* SOS = scan data follows */
+        if (m < 0xC0) return 0;
+        uint16_t mlen = ((uint16_t)data[pos+2] << 8) | data[pos+3];
+        if (mlen < 2) return 0;
+        pos += 2 + mlen;
+        markers++;
+    }
+    /* Ran out of data (first marker spans past AES region): accept if >= 1 valid marker */
+    return markers >= 1;
+}
+
+/* Validate PNG: 8-byte sig + IHDR chunk */
+static int verify_png_chain(const unsigned char *data, size_t len) {
+    static const unsigned char sig[8] = {0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A};
+    if (len < 24 || memcmp(data, sig, 8) != 0) return 0;
+    /* IHDR chunk at offset 8: length(4) + "IHDR"(4) + data(13) + CRC(4) */
+    return (data[12]=='I' && data[13]=='H' && data[14]=='D' && data[15]=='R');
+}
+
 static int verify_key(int pat_idx) {
     pattern_t *p = &patterns[pat_idx];
     FILE *f = fopen(p->sample_path, "rb");
@@ -192,7 +235,19 @@ static int verify_key(int pat_idx) {
         ct, ct_size, pt, ct_size, &moved);
     free(ct);
 
-    int ok = (st == kCCSuccess && moved >= 3 && is_image_magic(pt));
+    if (st != kCCSuccess || moved < 16) { free(pt); return 0; }
+
+    /* Deep validation based on image type */
+    int ok = 0;
+    if (pt[0] == 0xFF && pt[1] == 0xD8)
+        ok = verify_jpeg_chain(pt, moved);
+    else if (pt[0] == 0x89 && pt[1] == 0x50)
+        ok = verify_png_chain(pt, moved);
+    else if (pt[0] == 'G' && pt[1] == 'I' && pt[2] == 'F')
+        ok = (moved >= 6 && pt[3] == '8' && (pt[4]=='9'||pt[4]=='7') && pt[5]=='a');
+    else if (pt[0] == 'R' && pt[1] == 'I')
+        ok = (moved >= 12 && pt[8]=='W' && pt[9]=='E' && pt[10]=='B' && pt[11]=='P');
+
     free(pt);
     return ok;
 }
