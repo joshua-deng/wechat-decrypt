@@ -100,7 +100,17 @@ static int load_key_map(const char *path) {
 
     /* Simple parser: find all "32hex": "32hex" pairs */
     const char *p = json;
-    while ((p = strchr(p, '"')) && n_keys < MAX_KEYS) {
+    int warned_capacity = 0;
+    while ((p = strchr(p, '"')) != NULL) {
+        if (n_keys >= MAX_KEYS) {
+            if (!warned_capacity) {
+                fprintf(stderr, "Warning: image_keys.json exceeds MAX_KEYS=%d, extra keys ignored\n",
+                        MAX_KEYS);
+                warned_capacity = 1;
+            }
+            break;
+        }
+
         p++;
         const char *end = strchr(p, '"');
         if (!end) break;
@@ -110,7 +120,11 @@ static int load_key_map(const char *path) {
         char ct_hex[33];
         memcpy(ct_hex, p, 32);
         ct_hex[32] = '\0';
-        p = end + 1;
+        const char *colon = end + 1;
+        while (*colon == ' ' || *colon == '\t' || *colon == '\r' || *colon == '\n')
+            colon++;
+        if (*colon != ':') { p = end + 1; continue; }
+        p = colon + 1;
 
         /* Find next quoted string (the value) */
         p = strchr(p, '"');
@@ -208,6 +222,7 @@ static int decrypt_v2_file(const char *input_path, const char *output_dir,
 
     if ((uint64_t)aes_size > 100u * 1024u * 1024u ||
         (uint64_t)xor_size > 100u * 1024u * 1024u) {
+        fclose(fin);
         return -6;
     }
 
@@ -321,7 +336,8 @@ static void walk_dir(const char *dir, walk_ctx *ctx) {
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
 
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
 
         if (S_ISDIR(st.st_mode)) {
             walk_dir(path, ctx);
@@ -388,9 +404,12 @@ int main(int argc, char *argv[]) {
     if (argc >= 4) {
         /* Manual single-key mode */
         strncpy(key_hex, argv[1], sizeof(key_hex) - 1);
+        key_hex[sizeof(key_hex) - 1] = '\0';
         strncpy(image_dir, argv[2], sizeof(image_dir) - 1);
+        image_dir[sizeof(image_dir) - 1] = '\0';
         strncpy(output_dir, argv[3], sizeof(output_dir) - 1);
-        have_single_key = 1;
+        output_dir[sizeof(output_dir) - 1] = '\0';
+        have_single_key = (key_hex[0] != '\0');
     } else {
         /* Load image_keys.json first (multi-key) */
         char keys_path[MAX_PATH];
@@ -438,6 +457,7 @@ int main(int argc, char *argv[]) {
             strncpy(output_dir, out_rel, sizeof(output_dir) - 1);
         else
             snprintf(output_dir, sizeof(output_dir), "%s/%s", exe_dir, out_rel);
+        output_dir[sizeof(output_dir) - 1] = '\0';
 
         if (db_dir[0]) {
             char *s = strrchr(db_dir, '/');

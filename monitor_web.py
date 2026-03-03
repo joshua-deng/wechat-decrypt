@@ -39,6 +39,10 @@ messages_lock = threading.Lock()
 MAX_LOG = 500
 
 
+def normalize_rel_path(path):
+    return path.replace("\\", "/").strip("/")
+
+
 def decrypt_page(enc_key, page_data, pgno):
     """解密单个加密页面"""
     iv = page_data[PAGE_SZ - RESERVE_SZ: PAGE_SZ - RESERVE_SZ + 16]
@@ -521,11 +525,15 @@ def main():
 
     with open(KEYS_FILE) as f:
         keys = json.load(f)
+    normalized_keys = {
+        normalize_rel_path(path): value for path, value in keys.items()
+    }
 
-    session_key_name = os.path.join("session", "session.db")
-    if session_key_name not in keys:
-        session_key_name = "session/session.db" if "session/session.db" in keys else "session\\session.db"
-    enc_key = bytes.fromhex(keys[session_key_name]["enc_key"])
+    session_key_name = normalize_rel_path(os.path.join("session", "session.db"))
+    if session_key_name not in normalized_keys:
+        print(f"[ERROR] 未找到会话数据库密钥: {session_key_name}", flush=True)
+        return
+    enc_key = bytes.fromhex(normalized_keys[session_key_name]["enc_key"])
     session_db = os.path.join(DB_DIR, "session", "session.db")
 
     print("加载联系人...", flush=True)

@@ -105,9 +105,9 @@ static int hex2bytes(const char *h, unsigned char *o, int max) {
     while (n < max) {
         if (!h[0] || !h[1]) return 0;
         if (!((h[0] >= '0' && h[0] <= '9') || (h[0] >= 'a' && h[0] <= 'f') ||
-              (h[0] >= 'A' && h[0] <= 'F')) return 0;
+              (h[0] >= 'A' && h[0] <= 'F'))) return 0;
         if (!((h[1] >= '0' && h[1] <= '9') || (h[1] >= 'a' && h[1] <= 'f') ||
-              (h[1] >= 'A' && h[1] <= 'F')) return 0;
+              (h[1] >= 'A' && h[1] <= 'F'))) return 0;
 
         unsigned int b = 0;
         if (sscanf(h, "%2x", &b) != 1) return 0;
@@ -149,7 +149,8 @@ static void discover_dir(const char *dir) {
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         struct stat st;
-        if (stat(path, &st) != 0) continue;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
         if (S_ISDIR(st.st_mode)) {
             discover_dir(path);
             continue;
@@ -176,6 +177,7 @@ static void discover_dir(const char *dir) {
             patterns[npatterns].solved = 0;
             strncpy(patterns[npatterns].sample_path, path,
                     sizeof(patterns[npatterns].sample_path) - 1);
+            patterns[npatterns].sample_path[sizeof(patterns[npatterns].sample_path) - 1] = '\0';
             npatterns++;
         }
     }
@@ -301,10 +303,19 @@ static int scan_pid(pid_t pid) {
     int n_unsolved = 0;
     for (int i = 0; i < npatterns; i++)
         if (!patterns[i].solved) unsolved_idx[n_unsolved++] = i;
-    if (n_unsolved == 0) return 0;
+    if (n_unsolved == 0) {
+        mach_port_deallocate(mach_task_self(), task);
+        return 0;
+    }
 
     unsigned char *batch_ct = malloc(n_unsolved * 16);
     unsigned char *batch_pt = malloc(n_unsolved * 16);
+    if (!batch_ct || !batch_pt) {
+        free(batch_ct);
+        free(batch_pt);
+        mach_port_deallocate(mach_task_self(), task);
+        return 0;
+    }
     for (int i = 0; i < n_unsolved; i++)
         memcpy(batch_ct + i*16, patterns[unsolved_idx[i]].ct, 16);
 
@@ -312,7 +323,7 @@ static int scan_pid(pid_t pid) {
     mach_vm_size_t rsize;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count;
-    mach_port_t obj;
+    mach_port_t obj = MACH_PORT_NULL;
 
     long regions = 0, found_this_pid = 0;
     long long total_bytes = 0, tests = 0;
@@ -323,6 +334,10 @@ static int scan_pid(pid_t pid) {
                             (vm_region_info_t)&info, &count, &obj);
         if (kr != KERN_SUCCESS) break;
         regions++;
+        if (obj != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), obj);
+            obj = MACH_PORT_NULL;
+        }
 
         if ((info.protection & VM_PROT_READ) && rsize > 0 && rsize < REGION_MAX) {
             vm_offset_t data;
@@ -466,6 +481,7 @@ static int scan_pid(pid_t pid) {
 
     free(batch_ct);
     free(batch_pt);
+    mach_port_deallocate(mach_task_self(), task);
     return (int)found_this_pid;
 }
 
@@ -506,7 +522,7 @@ static int load_keys(const char *dir) {
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
-    if (sz < 0) { fclose(f); return 0; }
+    if (sz <= 0) { fclose(f); return 0; }
     fseek(f, 0, SEEK_SET);
     char *json = malloc((size_t)sz + 1);
     if (!json) { fclose(f); return 0; }
@@ -575,6 +591,7 @@ int main(int argc, char *argv[]) {
 
     if (argc >= 2) {
         strncpy(image_dir, argv[1], sizeof(image_dir) - 1);
+        image_dir[sizeof(image_dir) - 1] = '\0';
     } else {
         /* Read config.json */
         char cfg_path[MAX_PATH];

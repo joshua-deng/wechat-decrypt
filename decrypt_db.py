@@ -27,6 +27,11 @@ OUT_DIR = _cfg["decrypted_dir"]
 KEYS_FILE = _cfg["keys_file"]
 
 
+def normalize_rel_path(path):
+    """Normalize key path for cross-platform matching."""
+    return path.replace("\\", "/").strip("/")
+
+
 def derive_mac_key(enc_key, salt):
     """从enc_key派生HMAC密钥"""
     mac_salt = bytes(b ^ 0x3a for b in salt)
@@ -117,6 +122,9 @@ def main():
 
     with open(KEYS_FILE) as f:
         keys = json.load(f)
+    normalized_keys = {
+        normalize_rel_path(path): value for path, value in keys.items()
+    }
 
     print(f"\n加载 {len(keys)} 个数据库密钥")
     print(f"输出目录: {OUT_DIR}")
@@ -141,16 +149,13 @@ def main():
     total_bytes = 0
 
     for rel, path, sz in db_files:
-        # 兼容Windows反斜杠和POSIX正斜杠格式的key
-        rel_key = rel.replace('/', '\\')
-        if rel_key not in keys:
-            rel_key = rel.replace('\\', '/')
-        if rel_key not in keys:
+        rel_key = normalize_rel_path(rel)
+        if rel_key not in normalized_keys:
             print(f"SKIP: {rel} (无密钥)")
             failed += 1
             continue
 
-        enc_key = bytes.fromhex(keys[rel_key]["enc_key"])
+        enc_key = bytes.fromhex(normalized_keys[rel_key]["enc_key"])
         out_path = os.path.join(OUT_DIR, rel)
 
         print(f"解密: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")

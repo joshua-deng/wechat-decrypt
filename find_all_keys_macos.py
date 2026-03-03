@@ -31,6 +31,34 @@ boolean_t = ctypes.c_int32
 memory_object_name_t = mach_port_t
 vm_behavior_t = ctypes.c_int32
 
+# Function signatures (ctypes defaults are unsafe for 64-bit Mach VM APIs)
+libc.task_for_pid.argtypes = [mach_port_t, ctypes.c_int, ctypes.POINTER(mach_port_t)]
+libc.task_for_pid.restype = kern_return_t
+libc.mach_vm_region.argtypes = [
+    mach_port_t,
+    ctypes.POINTER(vm_address_t),
+    ctypes.POINTER(vm_size_t),
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(natural_t),
+    ctypes.POINTER(mach_port_t),
+]
+libc.mach_vm_region.restype = kern_return_t
+libc.mach_vm_read.argtypes = [
+    mach_port_t,
+    vm_address_t,
+    vm_size_t,
+    ctypes.POINTER(vm_offset_t),
+    ctypes.POINTER(natural_t),
+]
+libc.mach_vm_read.restype = kern_return_t
+libc.mach_vm_deallocate.argtypes = [mach_port_t, vm_address_t, vm_size_t]
+libc.mach_vm_deallocate.restype = kern_return_t
+libc.mach_port_deallocate.argtypes = [mach_port_t, mach_port_t]
+libc.mach_port_deallocate.restype = kern_return_t
+
+MACH_TASK_SELF = mach_port_t.in_dll(libc, 'mach_task_self_')
+
 # vm_region_basic_info_64
 class vm_region_basic_info_64(ctypes.Structure):
     _fields_ = [
@@ -52,9 +80,8 @@ VM_PROT_WRITE = 2
 
 def get_task(pid):
     """Get mach task port for a process"""
-    mach_task_self = ctypes.c_uint32.in_dll(libc, 'mach_task_self_')
     task = mach_port_t(0)
-    ret = libc.task_for_pid(mach_task_self, pid, ctypes.byref(task))
+    ret = libc.task_for_pid(MACH_TASK_SELF, pid, ctypes.byref(task))
     if ret != 0:
         print(f"task_for_pid failed: {ret}")
         sys.exit(1)
@@ -86,7 +113,11 @@ def get_regions(task):
         if (info.protection & VM_PROT_READ) and (info.protection & VM_PROT_WRITE):
             if size.value > 0 and size.value < 200 * 1024 * 1024:
                 regions.append((address.value, size.value))
-        
+
+        if object_name.value:
+            libc.mach_port_deallocate(MACH_TASK_SELF, object_name)
+            object_name = mach_port_t(0)
+
         address.value += size.value
         info_count.value = VM_REGION_BASIC_INFO_COUNT_64
     
@@ -94,7 +125,7 @@ def get_regions(task):
 
 def read_memory(task, address, size):
     """Read memory from a task"""
-    data_ptr = ctypes.c_void_p(0)
+    data_ptr = vm_offset_t(0)
     data_cnt = natural_t(0)
     ret = libc.mach_vm_read(
         task,
@@ -105,12 +136,15 @@ def read_memory(task, address, size):
     )
     if ret != 0:
         return None
-    
+
+    if data_ptr.value == 0 or data_cnt.value == 0:
+        return None
+
     buf = ctypes.string_at(data_ptr.value, data_cnt.value)
     # Deallocate
     libc.mach_vm_deallocate(
-        ctypes.c_uint32.in_dll(libc, 'mach_task_self_'),
-        data_ptr,
+        MACH_TASK_SELF,
+        vm_address_t(data_ptr.value),
         vm_size_t(data_cnt.value)
     )
     return buf
@@ -153,6 +187,7 @@ if __name__ == '__main__':
     scanned = 0
     
     CHUNK = 8 * 1024 * 1024  # Read 8MB at a time
+    OVERLAP = 98             # Pattern length (99) - 1, avoid boundary misses
     
     for i, (base, size) in enumerate(regions):
         offset = 0
@@ -160,7 +195,8 @@ if __name__ == '__main__':
             chunk_size = min(CHUNK, size - offset)
             data = read_memory(task, base + offset, chunk_size)
             if not data:
-                offset += chunk_size
+                step = (chunk_size - OVERLAP) if chunk_size > OVERLAP else chunk_size
+                offset += step
                 continue
             
             scanned += len(data)
@@ -185,11 +221,12 @@ if __name__ == '__main__':
                                 print(f"  [FOUND] salt={salt}")
                                 print(f"    key={enc_key}")
                                 print(f"    addr=0x{addr_found:016x}")
-                    except:
+                    except UnicodeDecodeError:
                         pass
                 pos = idx + 1
-            
-            offset += chunk_size
+
+            step = (chunk_size - OVERLAP) if chunk_size > OVERLAP else chunk_size
+            offset += step
         
         pct = (i+1) / len(regions) * 100
         if (i+1) % 100 == 0:
@@ -204,5 +241,6 @@ if __name__ == '__main__':
         out[salt] = {"enc_key": key, "addr": hex(addr)}
     
     out_path = os.path.expanduser("~/wechat_keys_raw.json")
-    json.dump(out, open(out_path, 'w'), indent=2)
+    with open(out_path, 'w') as f:
+        json.dump(out, f, indent=2)
     print(f"Saved to {out_path}")
