@@ -40,13 +40,9 @@ pip install pycryptodome
 
 ### 1. 配置
 
-复制配置模板并修改：
+首次运行任意脚本时，程序会自动检测微信数据目录并生成 `config.json`，无需手动配置。
 
-```bash
-copy config.example.json config.json
-```
-
-编辑 `config.json`：
+如果自动检测失败（例如微信安装在非默认位置），手动创建 `config.json`：
 ```json
 {
     "db_dir": "D:\\xwechat_files\\你的微信ID\\db_storage",
