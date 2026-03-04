@@ -58,3 +58,24 @@ def test_run_round_report_marks_non_dry_run(tmp_path: Path) -> None:
         "(this minimal implementation only generates local artifacts)."
         in report
     )
+
+
+def test_run_round_generates_open_tasks_from_unresolved_hashes(tmp_path: Path) -> None:
+    decrypted_images_dir = tmp_path / "decrypted_images"
+
+    first = decrypted_images_dir / "attach" / "hash_alpha" / "2026-01" / "Img" / "a.bin"
+    second = (
+        decrypted_images_dir / "attach" / "hash_bravo" / "2026-02" / "Img" / "b_t.bin"
+    )
+
+    first.parent.mkdir(parents=True, exist_ok=True)
+    second.parent.mkdir(parents=True, exist_ok=True)
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+
+    round_dir = run_round(tmp_path, dry_run=True)
+    open_tasks = (round_dir / "open_tasks.md").read_text(encoding="utf-8")
+
+    assert open_tasks != build_open_tasks([])
+    assert "chat_name: hash_alpha" in open_tasks
+    assert "chat_name: hash_bravo" in open_tasks

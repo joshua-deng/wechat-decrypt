@@ -159,6 +159,26 @@ python find_image_key.py
 
 > **注意**: AES 密钥仅在微信查看图片时临时加载到内存中。如果扫描未找到密钥，请先在微信中查看几张图片，然后立即重新运行脚本。
 
+### 7. 历史图片覆盖 Round（open_tasks / report round）
+
+使用统一入口创建一轮覆盖工件：
+
+```bash
+python3 -m tools.image_coverage.run_round --dry-run
+python3 -m tools.image_coverage.run_round
+```
+
+每次执行都会在 `work/image_coverage/round-YYYYMMDD-HHMM`（同分钟自动加 `-01`、`-02`）生成：
+
+- `open_tasks.md`：本轮需要在微信里打开的目标任务清单
+- `report.md`：本轮 report round 记录（包含 dry_run 标记和 round_dir）
+
+推荐流程：
+
+1. 先执行 dry-run，确认 round 目录和 `open_tasks.md` 已生成
+2. 按 `open_tasks.md` 在微信中逐项打开图片并抓取 key
+3. 执行正式 round，再更新本轮 `report.md` 结论并进入下一轮
+
 ## 文件说明
 
 | 文件 | 说明 |
