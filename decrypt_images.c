@@ -289,12 +289,10 @@ static int decrypt_v2_file(const char *input_path, const char *output_dir,
     }
     fclose(fin);
 
-    /* If multi-key mode: look up key by CT block 0 */
-    if (!aes_key && aes_ct_size >= 16) {
-        aes_key = find_key_for_ct(aes_ct);
-        if (!aes_key) {
-            free(aes_ct); free(raw_data); free(xor_data); return -5;
-        }
+    /* Try multi-key lookup (image_keys.json) first, then fall back to provided key */
+    if (aes_ct_size >= 16) {
+        const unsigned char *mk = find_key_for_ct(aes_ct);
+        if (mk) aes_key = mk;
     }
     if (!aes_key) { free(aes_ct); free(raw_data); free(xor_data); return -5; }
 
@@ -409,8 +407,9 @@ static void walk_dir(const char *dir, walk_ctx *ctx) {
             if (*rel == '/') rel++;
 
             int xor_detected = -1;
-            /* In multi-key mode, pass NULL as key — decrypt_v2_file looks it up */
-            const unsigned char *key = ctx->multi_key ? NULL : ctx->fallback_key;
+            /* In multi-key mode, pass fallback_key — decrypt_v2_file tries
+             * image_keys.json lookup first, falls back to this key if provided */
+            const unsigned char *key = ctx->fallback_key;
             int ret = decrypt_v2_file(path, ctx->output_dir, rel,
                                        key, ctx->xor_key,
                                        ctx->auto_xor, &xor_detected);

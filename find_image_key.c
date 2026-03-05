@@ -470,8 +470,10 @@ static int scan_pid(pid_t pid) {
                                         printf("\n  *** FOUND KEY: %s ***\n", kh);
                                         printf("      Pattern: %s (%d files)\n",
                                                ch, patterns[idx].file_count);
-                                        printf("      ASCII context: %.32s\n",
-                                               buf + run_start);
+                                        int ctx_len = data_cnt - run_start;
+                                        if (ctx_len > 32) ctx_len = 32;
+                                        printf("      ASCII context: %.*s\n",
+                                               ctx_len, buf + run_start);
                                         found_this_pid++;
                                         /* Rebuild */
                                         n_unsolved = 0;
