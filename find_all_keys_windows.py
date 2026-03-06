@@ -13,7 +13,6 @@ print = functools.partial(print, flush=True)
 
 from key_scan_common import (
     collect_db_files, scan_memory_for_keys, cross_verify_keys, save_results,
-    PAGE_SZ, KEY_SZ, SALT_SZ,
 )
 
 kernel32 = ctypes.windll.kernel32
