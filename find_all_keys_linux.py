@@ -28,13 +28,26 @@ def _safe_readlink(path):
         return ""
 
 
+_INTERPRETERS = {"python", "python3", "bash", "sh", "zsh", "node", "perl", "ruby"}
+
+
 def _is_wechat_process(pid):
-    """检查 pid 是否为微信进程。"""
+    """检查 pid 是否为微信进程。
+
+    使用子串匹配以覆盖 wechat 主进程和 WeChatAppEx 子进程，
+    同时排除自身和解释器进程（如 python3 find_all_keys.py）。
+    """
+    if pid == os.getpid():
+        return False
     try:
         with open(f"/proc/{pid}/comm") as f:
             comm = f.read().strip()
-        exe_name = os.path.basename(_safe_readlink(f"/proc/{pid}/exe")) or comm
-        haystack = " ".join((comm, exe_name)).lower()
+        exe_path = _safe_readlink(f"/proc/{pid}/exe")
+        exe_name = os.path.basename(exe_path)
+        # 排除脚本解释器进程（避免匹配 python3 wechat-decrypt 等）
+        if exe_name.lower() in _INTERPRETERS:
+            return False
+        haystack = f"{comm} {exe_name}".lower()
         return "wechat" in haystack or "weixin" in haystack
     except (PermissionError, FileNotFoundError, ProcessLookupError):
         return False
@@ -85,12 +98,16 @@ def _get_readable_regions(pid):
                 continue
             if "r" not in parts[1]:
                 continue
-            # 跳过特殊映射
+            # 跳过特殊映射和无关系统库，但保留 wcdb/wechat 相关库
             if len(parts) >= 6:
                 mapping_name = parts[5]
                 if mapping_name in _SKIP_MAPPINGS:
                     continue
-                if any(mapping_name.startswith(p) for p in _SKIP_PATH_PREFIXES):
+                mapping_lower = mapping_name.lower()
+                if (any(mapping_name.startswith(p) for p in _SKIP_PATH_PREFIXES)
+                        and "wcdb" not in mapping_lower
+                        and "wechat" not in mapping_lower
+                        and "weixin" not in mapping_lower):
                     continue
             start_s, end_s = parts[0].split("-")
             start = int(start_s, 16)

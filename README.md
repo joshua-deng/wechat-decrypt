@@ -209,7 +209,6 @@ V2 文件结构: `[6B signature] [4B aes_size LE] [4B xor_size LE] [1B padding]`
 
 ## macOS 数据库密钥扫描 (WeChat 4.x)
 
-
 macOS 版微信 4.x 使用 SQLCipher 4 加密本地数据库，密钥格式为 `x'<64hex_key><32hex_salt>'`。C 版扫描器通过 Mach VM API 扫描微信进程内存提取密钥。
 
 ### 前置条件

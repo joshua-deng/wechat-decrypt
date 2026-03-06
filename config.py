@@ -105,14 +105,21 @@ def _auto_detect_db_dir_windows():
 def _auto_detect_db_dir_linux():
     """自动检测 Linux 微信 db_storage 路径。
 
-    优先搜索当前用户的 home 目录，避免以 root 运行时误检测其他用户的数据。
+    优先搜索当前用户的 home 目录。以 sudo 运行时通过 SUDO_USER 回退到
+    实际用户的 home，避免只搜索 /root 而遗漏真实数据目录。
     """
     seen = set()
     candidates = []
-    # 只搜索当前用户的 home 目录
     search_roots = [
         os.path.expanduser("~/Documents/xwechat_files"),
     ]
+    # sudo 运行时，~ 展开为 /root；回退到实际用户的 home
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        sudo_home = os.path.expanduser(f"~{sudo_user}")
+        fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
+        if fallback not in search_roots:
+            search_roots.append(fallback)
 
     for root in search_roots:
         if not os.path.isdir(root):
