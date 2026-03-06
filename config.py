@@ -119,15 +119,13 @@ def _auto_detect_db_dir_linux():
         # 验证 SUDO_USER 是合法系统用户，防止路径注入
         import pwd
         try:
-            pw = pwd.getpwnam(sudo_user)
-            sudo_home = pw.pw_dir
+            sudo_home = pwd.getpwnam(sudo_user).pw_dir
         except KeyError:
             sudo_home = None
-        if not sudo_home:
-            sudo_home = os.path.expanduser(f"~{sudo_user}")
-        fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
-        if fallback not in search_roots:
-            search_roots.append(fallback)
+        if sudo_home:
+            fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
+            if fallback not in search_roots:
+                search_roots.append(fallback)
 
     for root in search_roots:
         if not os.path.isdir(root):
@@ -176,15 +174,12 @@ def load_config():
         except json.JSONDecodeError:
             print(f"[!] {CONFIG_FILE} 格式损坏，将使用默认配置")
             cfg = {}
-    cfg = {**_DEFAULT, **cfg}
-
     # db_dir 缺失或仍为模板值时，尝试自动检测
     db_dir = cfg.get("db_dir", "")
     if not db_dir or db_dir == _DEFAULT_TEMPLATE_DIR or "your_wxid" in db_dir:
         detected = auto_detect_db_dir()
         if detected:
             print(f"[+] 自动检测到微信数据目录: {detected}")
-            # 合并默认值并保存
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
             with open(CONFIG_FILE, "w") as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
@@ -200,6 +195,8 @@ def load_config():
             else:
                 print(f"    路径可在 微信设置 → 文件管理 中找到")
             sys.exit(1)
+    else:
+        cfg = {**_DEFAULT, **cfg}
 
     # 将相对路径转为绝对路径
     base = os.path.dirname(os.path.abspath(__file__))

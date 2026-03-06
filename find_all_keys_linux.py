@@ -28,27 +28,31 @@ def _safe_readlink(path):
         return ""
 
 
+_KNOWN_COMMS = {"wechat", "wechatappex", "weixin"}
 _INTERPRETER_PREFIXES = ("python", "bash", "sh", "zsh", "node", "perl", "ruby")
 
 
 def _is_wechat_process(pid):
     """检查 pid 是否为微信进程。
 
-    使用子串匹配以覆盖 wechat 主进程和 WeChatAppEx 子进程，
-    同时排除自身和解释器进程（如 python3 find_all_keys.py）。
+    优先精确匹配 comm 名称（wechat、WeChatAppEx 等），
+    再用 exe 路径子串匹配作为 fallback，同时排除解释器进程。
     """
     if pid == os.getpid():
         return False
     try:
         with open(f"/proc/{pid}/comm") as f:
             comm = f.read().strip()
+        # 优先精确匹配 comm（最可靠）
+        if comm.lower() in _KNOWN_COMMS:
+            return True
         exe_path = _safe_readlink(f"/proc/{pid}/exe")
         exe_name = os.path.basename(exe_path)
         # 排除脚本解释器进程（避免匹配 python3.11 wechat-decrypt 等）
         if any(exe_name.lower().startswith(p) for p in _INTERPRETER_PREFIXES):
             return False
-        haystack = f"{comm} {exe_name}".lower()
-        return "wechat" in haystack or "weixin" in haystack
+        # fallback: exe 名称子串匹配
+        return "wechat" in exe_name.lower() or "weixin" in exe_name.lower()
     except (PermissionError, FileNotFoundError, ProcessLookupError):
         return False
 
