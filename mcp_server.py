@@ -5,7 +5,7 @@ Based on FastMCP (stdio transport), reuses existing decryption.
 Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
-import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit
+import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re
 import hmac as hmac_mod
 from datetime import datetime
 from Crypto.Cipher import AES
@@ -335,8 +335,7 @@ def _parse_message_content(content, local_type, is_group):
 MSG_DB_KEYS = sorted([
     k for k in ALL_KEYS
     if any(v.startswith("message/") for v in key_path_variants(k))
-    and any(v.endswith(".db") for v in key_path_variants(k))
-    and "fts" not in k and "resource" not in k
+    and any(re.search(r"message_\d+\.db$", v) for v in key_path_variants(k))
 ])
 
 

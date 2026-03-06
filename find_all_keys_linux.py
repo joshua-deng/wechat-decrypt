@@ -146,6 +146,9 @@ def main():
         except PermissionError:
             print(f"[WARN] 无法读取 /proc/{pid}/maps，权限不足，跳过")
             continue
+        except (FileNotFoundError, ProcessLookupError):
+            print(f"[WARN] PID {pid} 已退出，跳过")
+            continue
 
         total_bytes = sum(s for _, s in regions)
         total_mb = total_bytes / 1024 / 1024
@@ -156,6 +159,9 @@ def main():
             mem = open(f"/proc/{pid}/mem", "rb")
         except PermissionError:
             print(f"[WARN] 无法打开 /proc/{pid}/mem，权限不足，跳过")
+            continue
+        except (FileNotFoundError, ProcessLookupError):
+            print(f"[WARN] PID {pid} 已退出，跳过")
             continue
 
         try:
