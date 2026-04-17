@@ -579,4 +579,3 @@ class MessageDB:
             if result:
                 return MessageItem(*[*result, wxid])
         return None
-
