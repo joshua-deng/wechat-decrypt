@@ -426,9 +426,9 @@ class MessageProcessor:
             content = f"[拍一拍] {template}"
         else:
             pat_suffix = patinfo.get("patsuffix", "")
-            contact = ContactDB()
-            pat_from_username_item = contact.get_contact_by_wxid(pat_from_username)
-            pat_ted_username_item = contact.get_contact_by_wxid(pat_ted_username)
+            with ContactDB() as contact:
+                pat_from_username_item = contact.get_contact_by_wxid(pat_from_username)
+                pat_ted_username_item = contact.get_contact_by_wxid(pat_ted_username)
             content = f"[拍一拍] {pat_from_username_item.format_name} 拍了拍 {pat_ted_username_item.format_name} {pat_suffix}"
 
 
@@ -534,7 +534,6 @@ class MessageDB:
     MESSAGE_DB_KEY_PATTERN = re.compile(r"^message[\\/]message_\d+\.db$")
 
     def __init__(self):
-        self.contact = ContactDB()
         self.__all_message_db_connection: Optional[List[DBConnectionItem]] = None
 
     @property
@@ -555,8 +554,6 @@ class MessageDB:
             for conn_item in self.__all_message_db_connection:
                 conn_item.close()
             self.__all_message_db_connection = None
-        self.contact.close()
-
 
     def get_messages(self, wxid: str, start_time: str, end_time: str, limit: int = None) -> List[MessageItem]:
         result: List[MessageItem] = []
