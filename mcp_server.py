@@ -5,7 +5,9 @@ Based on FastMCP (stdio transport), reuses existing decryption.
 Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
+import io
 import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re
+import wave
 import hmac as hmac_mod
 from contextlib import closing
 from datetime import datetime
@@ -803,18 +805,19 @@ def _build_message_filters(start_ts=None, end_ts=None, keyword=''):
     return clauses, params
 
 
-def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0):
+def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0, oldest_first=False):
     if not _is_safe_msg_table_name(table_name):
         raise ValueError(f'非法消息表名: {table_name}')
 
     clauses, params = _build_message_filters(start_ts, end_ts, keyword)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+    order = 'ASC' if oldest_first else 'DESC'
     sql = f"""
         SELECT local_id, local_type, create_time, real_sender_id, message_content,
                WCDB_CT_message_content
         FROM [{table_name}]
         {where_sql}
-        ORDER BY create_time DESC
+        ORDER BY create_time {order}
     """
     if limit is None:
         return conn.execute(sql, params).fetchall()
@@ -994,14 +997,14 @@ def _history_query_batch_size(candidate_limit):
     return min(candidate_limit, _HISTORY_QUERY_BATCH_SIZE)
 
 
-def _page_ranked_entries(entries, limit, offset):
-    ordered = sorted(entries, key=lambda item: item[0], reverse=True)
+def _page_ranked_entries(entries, limit, offset, oldest_first=False):
+    ordered = sorted(entries, key=lambda item: item[0], reverse=not oldest_first)
     paged = ordered[offset:offset + limit]
     paged.sort(key=lambda item: item[0])
     return paged
 
 
-def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20, offset=0):
+def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20, offset=0, oldest_first=False):
     collected = []
     failures = []
     candidate_limit = _candidate_page_size(limit, offset)
@@ -1022,6 +1025,7 @@ def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20
                         end_ts=end_ts,
                         limit=batch_size,
                         offset=fetch_offset,
+                        oldest_first=oldest_first,
                     )
                     if not rows:
                         break
@@ -1042,7 +1046,7 @@ def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20
         except Exception as e:
             failures.append(f"{table_ctx['db_path']}: {e}")
 
-    paged = _page_ranked_entries(collected, limit, offset)
+    paged = _page_ranked_entries(collected, limit, offset, oldest_first=oldest_first)
     return [line for _, line in paged], failures
 
 
@@ -1348,7 +1352,7 @@ def get_recent_sessions(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_time: str = "", end_time: str = "") -> str:
+def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_time: str = "", end_time: str = "", oldest_first: bool = False) -> str:
     """获取指定聊天的消息记录。
 
     Args:
@@ -1357,6 +1361,7 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         offset: 分页偏移量，默认0
         start_time: 起始时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
         end_time: 结束时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
+        oldest_first: 为 True 时返回最早的消息（默认 False 返回最新消息）
     """
     try:
         _validate_pagination(limit, offset, limit_max=None)
@@ -1378,6 +1383,7 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         end_ts=end_ts,
         limit=limit,
         offset=offset,
+        oldest_first=oldest_first,
     )
 
     if not lines:
@@ -1732,6 +1738,186 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
         lines.append(line)
 
     return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines)
+
+
+# ============ 语音解密 ============
+
+DECODED_VOICE_DIR = os.path.join(SCRIPT_DIR, "decoded_voices")
+
+def _get_media_db_path():
+    return _cache.get("message/media_0.db")
+
+def _get_chat_name_id(conn, username):
+    row = conn.execute(
+        "SELECT rowid FROM Name2Id WHERE user_name = ?", (username,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _fetch_voice_row(username, local_id=None):
+    """Query VoiceInfo from media_0.db. Returns (voice_data, create_time) or None."""
+    media_db = _get_media_db_path()
+    if not media_db:
+        return None
+    with closing(sqlite3.connect(media_db)) as conn:
+        chat_name_id = _get_chat_name_id(conn, username)
+        if chat_name_id is None:
+            return None
+        if local_id is not None:
+            return conn.execute(
+                "SELECT voice_data, create_time FROM VoiceInfo "
+                "WHERE chat_name_id = ? AND local_id = ?",
+                (chat_name_id, local_id),
+            ).fetchone()
+        return None
+
+
+def _silk_to_wav(voice_data, create_time, username):
+    """Decode SILK voice blob to WAV file, return output path."""
+    import pysilk
+    data = bytes(voice_data)
+    silk_data = data[1:] if data[0] == 0x02 else data
+    os.makedirs(DECODED_VOICE_DIR, exist_ok=True)
+    time_str = datetime.fromtimestamp(create_time).strftime('%Y%m%d_%H%M%S')
+    out_path = os.path.join(DECODED_VOICE_DIR, f"{username}_{time_str}.wav")
+    inp = io.BytesIO(silk_data)
+    out = io.BytesIO()
+    pysilk.decode(inp, out, 24000)
+    pcm = out.getvalue()
+    with wave.open(out_path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+    return out_path, len(pcm)
+
+
+@mcp.tool()
+def get_voice_messages(chat_name: str, limit: int = 20) -> str:
+    """列出某个聊天中的语音消息。
+
+    返回语音的时间、local_id 和大小，可配合 decode_voice 工具解码。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        limit: 返回数量，默认20
+    """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    names = get_contact_names()
+    display_name = names.get(username, username)
+
+    media_db = _get_media_db_path()
+    if not media_db:
+        return "找不到 media_0.db"
+
+    with closing(sqlite3.connect(media_db)) as conn:
+        chat_name_id = _get_chat_name_id(conn, username)
+        if chat_name_id is None:
+            return f"{display_name} 无语音消息"
+
+        rows = conn.execute(
+            "SELECT local_id, create_time, length(voice_data) FROM VoiceInfo "
+            "WHERE chat_name_id = ? ORDER BY create_time DESC LIMIT ?",
+            (chat_name_id, limit),
+        ).fetchall()
+
+    if not rows:
+        return f"{display_name} 无语音消息"
+
+    lines = []
+    for local_id, create_time, size in rows:
+        time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M')
+        lines.append(f"[{time_str}] local_id={local_id}  {size/1024:.0f}KB")
+
+    return f"{display_name} 的 {len(lines)} 条语音消息:\n\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def decode_voice(chat_name: str, local_id: int) -> str:
+    """解码微信语音消息为 WAV 文件。
+
+    先用 get_voice_messages 获取 local_id，再用此工具解码。
+    输出文件保存在 decoded_voices/ 目录。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 语音消息的 local_id（从 get_voice_messages 获取）
+    """
+    try:
+        import pysilk  # noqa: F401
+    except ImportError:
+        return "缺少依赖: pip install silk-python"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    row = _fetch_voice_row(username, local_id)
+    if row is None:
+        return f"找不到 local_id={local_id} 的语音消息"
+
+    voice_data, create_time = row
+    out_path, pcm_len = _silk_to_wav(voice_data, create_time, username)
+    duration_s = pcm_len / (24000 * 2)
+    return (
+        f"解码成功!\n"
+        f"  文件: {out_path}\n"
+        f"  时长: {duration_s:.1f}秒\n"
+        f"  大小: {os.path.getsize(out_path):,} bytes"
+    )
+
+
+_whisper_model = None
+
+def _get_whisper_model(model_size="base"):
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        _whisper_model = whisper.load_model(model_size)
+    return _whisper_model
+
+
+@mcp.tool()
+def transcribe_voice(chat_name: str, local_id: int) -> str:
+    """将微信语音消息转录为文字（自动检测语言，保留原语言）。
+
+    会先解码 SILK 语音为 WAV，再用 Whisper 转录。
+    首次运行会下载 Whisper 模型（约 145MB）。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 语音消息的 local_id（从 get_voice_messages 获取）
+    """
+    try:
+        import whisper  # noqa: F401
+    except ImportError:
+        return "缺少依赖: pip install openai-whisper"
+    try:
+        import pysilk  # noqa: F401
+    except ImportError:
+        return "缺少依赖: pip install silk-python"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    row = _fetch_voice_row(username, local_id)
+    if row is None:
+        return f"找不到 local_id={local_id} 的语音消息"
+
+    voice_data, create_time = row
+    wav_path, _ = _silk_to_wav(voice_data, create_time, username)
+
+    model = _get_whisper_model()
+    result = model.transcribe(wav_path)
+    lang = result.get("language", "unknown")
+    text = result.get("text", "").strip()
+
+    time_label = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M')
+    return f"[{time_label}] ({lang})\n{text}"
 
 
 if __name__ == "__main__":

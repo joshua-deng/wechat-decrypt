@@ -6,7 +6,9 @@ python main.py decrypt  # 提取密钥 + 解密全部数据库
 """
 import json
 import os
+import platform
 import sys
+import subprocess
 
 import functools
 print = functools.partial(print, flush=True)
@@ -16,6 +18,8 @@ from key_utils import strip_key_metadata
 
 def check_wechat_running():
     """检查微信是否在运行，返回 True/False"""
+    if platform.system().lower() == "darwin":
+        return subprocess.run(["pgrep", "-x", "WeChat"], capture_output=True).returncode == 0
     from find_all_keys import get_pids
     try:
         get_pids()
@@ -43,6 +47,14 @@ def ensure_keys(keys_file, db_dir):
         if keys:
             print(f"[+] 已有 {len(keys)} 个数据库密钥")
             return
+
+    if platform.system().lower() == "darwin":
+        print("[!] macOS 请先运行 C 版扫描器提取密钥：")
+        print()
+        print("    sudo ./find_all_keys_macos")
+        print()
+        print("    完成后再运行 python main.py decrypt")
+        sys.exit(1)
 
     print("[*] 密钥文件不存在，正在从微信进程提取...")
     print()

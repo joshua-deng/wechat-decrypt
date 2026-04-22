@@ -23,3 +23,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Compiled binaries and output
+find_all_keys_macos
+decoded_voices/
