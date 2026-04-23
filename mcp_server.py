@@ -1744,8 +1744,21 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
 
 DECODED_VOICE_DIR = os.path.join(SCRIPT_DIR, "decoded_voices")
 
-def _get_media_db_path():
-    return _cache.get("message/media_0.db")
+# media DB 与 message DB 同样会分片（media_0.db、media_1.db…），
+# 每个分片各有独立的 Name2Id / VoiceInfo 表。
+MEDIA_DB_KEYS = sorted([
+    k for k in ALL_KEYS
+    if any(v.startswith("message/") for v in key_path_variants(k))
+    and any(re.search(r"media_\d+\.db$", v) for v in key_path_variants(k))
+])
+
+
+def _iter_media_db_paths():
+    for rel_key in MEDIA_DB_KEYS:
+        path = _cache.get(rel_key)
+        if path:
+            yield path
+
 
 def _get_chat_name_id(conn, username):
     row = conn.execute(
@@ -1754,32 +1767,31 @@ def _get_chat_name_id(conn, username):
     return row[0] if row else None
 
 
-def _fetch_voice_row(username, local_id=None):
-    """Query VoiceInfo from media_0.db. Returns (voice_data, create_time) or None."""
-    media_db = _get_media_db_path()
-    if not media_db:
-        return None
-    with closing(sqlite3.connect(media_db)) as conn:
-        chat_name_id = _get_chat_name_id(conn, username)
-        if chat_name_id is None:
-            return None
-        if local_id is not None:
-            return conn.execute(
+def _fetch_voice_row(username, local_id):
+    """遍历所有 media DB 分片，返回 (voice_data, create_time)；找不到返回 None。"""
+    for media_db in _iter_media_db_paths():
+        with closing(sqlite3.connect(media_db)) as conn:
+            chat_name_id = _get_chat_name_id(conn, username)
+            if chat_name_id is None:
+                continue
+            row = conn.execute(
                 "SELECT voice_data, create_time FROM VoiceInfo "
                 "WHERE chat_name_id = ? AND local_id = ?",
                 (chat_name_id, local_id),
             ).fetchone()
-        return None
+            if row:
+                return row
+    return None
 
 
-def _silk_to_wav(voice_data, create_time, username):
+def _silk_to_wav(voice_data, create_time, username, local_id):
     """Decode SILK voice blob to WAV file, return output path."""
     import pysilk
     data = bytes(voice_data)
     silk_data = data[1:] if data[0] == 0x02 else data
     os.makedirs(DECODED_VOICE_DIR, exist_ok=True)
     time_str = datetime.fromtimestamp(create_time).strftime('%Y%m%d_%H%M%S')
-    out_path = os.path.join(DECODED_VOICE_DIR, f"{username}_{time_str}.wav")
+    out_path = os.path.join(DECODED_VOICE_DIR, f"{username}_{time_str}_{local_id}.wav")
     inp = io.BytesIO(silk_data)
     out = io.BytesIO()
     pysilk.decode(inp, out, 24000)
@@ -1809,23 +1821,27 @@ def get_voice_messages(chat_name: str, limit: int = 20) -> str:
     names = get_contact_names()
     display_name = names.get(username, username)
 
-    media_db = _get_media_db_path()
-    if not media_db:
-        return "找不到 media_0.db"
+    if not MEDIA_DB_KEYS:
+        return "找不到 media DB"
 
-    with closing(sqlite3.connect(media_db)) as conn:
-        chat_name_id = _get_chat_name_id(conn, username)
-        if chat_name_id is None:
-            return f"{display_name} 无语音消息"
-
-        rows = conn.execute(
-            "SELECT local_id, create_time, length(voice_data) FROM VoiceInfo "
-            "WHERE chat_name_id = ? ORDER BY create_time DESC LIMIT ?",
-            (chat_name_id, limit),
-        ).fetchall()
+    # 从每个分片各取最多 limit 条后合并再截断：分片若有时间重叠也不会漏最新消息
+    rows = []
+    for media_db in _iter_media_db_paths():
+        with closing(sqlite3.connect(media_db)) as conn:
+            chat_name_id = _get_chat_name_id(conn, username)
+            if chat_name_id is None:
+                continue
+            rows.extend(conn.execute(
+                "SELECT local_id, create_time, length(voice_data) FROM VoiceInfo "
+                "WHERE chat_name_id = ? ORDER BY create_time DESC LIMIT ?",
+                (chat_name_id, limit),
+            ).fetchall())
 
     if not rows:
         return f"{display_name} 无语音消息"
+
+    rows.sort(key=lambda r: r[1], reverse=True)
+    rows = rows[:limit]
 
     lines = []
     for local_id, create_time, size in rows:
@@ -1860,7 +1876,7 @@ def decode_voice(chat_name: str, local_id: int) -> str:
         return f"找不到 local_id={local_id} 的语音消息"
 
     voice_data, create_time = row
-    out_path, pcm_len = _silk_to_wav(voice_data, create_time, username)
+    out_path, pcm_len = _silk_to_wav(voice_data, create_time, username, local_id)
     duration_s = pcm_len / (24000 * 2)
     return (
         f"解码成功!\n"
@@ -1909,7 +1925,7 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
         return f"找不到 local_id={local_id} 的语音消息"
 
     voice_data, create_time = row
-    wav_path, _ = _silk_to_wav(voice_data, create_time, username)
+    wav_path, _ = _silk_to_wav(voice_data, create_time, username, local_id)
 
     model = _get_whisper_model()
     result = model.transcribe(wav_path)
