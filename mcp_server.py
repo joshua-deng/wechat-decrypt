@@ -1786,6 +1786,8 @@ def _fetch_voice_row(username, local_id):
 
 def _silk_to_wav(voice_data, create_time, username, local_id):
     """Decode SILK voice blob to WAV file, return output path."""
+    # pypi 上有多个 SILK 相关包名（silk-python / pysilk / pilk），
+    # 这里用的是 synodriver/pysilk —— 安装包名 silk-python，import 名 pysilk
     import pysilk
     data = bytes(voice_data)
     silk_data = data[1:] if data[0] == 0x02 else data
@@ -1858,6 +1860,8 @@ def decode_voice(chat_name: str, local_id: int) -> str:
     先用 get_voice_messages 获取 local_id，再用此工具解码。
     输出文件保存在 decoded_voices/ 目录。
 
+    依赖: pip install silk-python (import 名为 pysilk)
+
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
         local_id: 语音消息的 local_id（从 get_voice_messages 获取）
@@ -1902,6 +1906,8 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
 
     会先解码 SILK 语音为 WAV，再用 Whisper 转录。
     首次运行会下载 Whisper 模型（约 145MB）。
+
+    依赖: pip install silk-python openai-whisper (silk-python 的 import 名为 pysilk)
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
