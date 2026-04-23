@@ -48,14 +48,6 @@ def ensure_keys(keys_file, db_dir):
             print(f"[+] 已有 {len(keys)} 个数据库密钥")
             return
 
-    if platform.system().lower() == "darwin":
-        print("[!] macOS 请先运行 C 版扫描器提取密钥：")
-        print()
-        print("    sudo ./find_all_keys_macos")
-        print()
-        print("    完成后再运行 python main.py decrypt")
-        sys.exit(1)
-
     print("[*] 密钥文件不存在，正在从微信进程提取...")
     print()
     from find_all_keys import main as extract_keys
