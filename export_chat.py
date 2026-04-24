@@ -30,6 +30,8 @@ Voice messages are exported as type "voice" without a transcription field.
 Run transcribe_chat.py on the output to fill in Whisper transcriptions.
 
 Requires the WeChat DBs to already be decrypted (see README).
+
+Full schema, field semantics, and loading examples: docs/chat_export_format.md
 """
 import json
 import sqlite3
