@@ -6,7 +6,7 @@ Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
 import io
-import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re
+import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re, threading
 import wave
 import hmac as hmac_mod
 from contextlib import closing
@@ -1890,9 +1890,92 @@ def decode_voice(chat_name: str, local_id: int) -> str:
     )
 
 
+# ============ 语音转录缓存 ============
+#
+# Whisper 转录耗时（CPU 下每条数秒到数十秒），且结果是确定性的
+# （同一段 voice_data → 同一段 text），非常适合缓存。
+#
+# 缓存 key 用 json.dumps([username, local_id])：local_id 在单个 username 下
+# 稳定唯一，套一层 JSON 序列化保证 username 里若含分隔符也不会与其它条目碰撞。
+#
+# 写入走 temp + os.replace 原子替换，避免进程中途被杀导致整份缓存损坏
+# （Whisper 的单次代价远高于 DBCache，破档不可接受）。
+#
+# 条目里记录 model_size：Whisper 升级默认模型后，旧条目自动视为失效并重跑。
+
+VOICE_TRANSCRIPTION_CACHE_FILE = os.path.join(SCRIPT_DIR, "voice_transcriptions.json")
+
+_voice_transcription_cache = None  # 懒加载 dict；None 表示尚未加载
+_voice_transcription_cache_lock = threading.Lock()
+_voice_transcription_save_warned = False  # 写失败仅首次写 stderr，避免刷屏
+
+
+def _voice_transcription_cache_key(username, local_id):
+    """构造缓存 key。用 json.dumps 兜底 username 里可能出现的分隔符。"""
+    return json.dumps([username, int(local_id)], ensure_ascii=False)
+
+
+def _load_voice_transcription_cache():
+    """加载缓存到模块级 dict，返回该 dict。
+
+    文件不存在 → 空 dict。JSON 损坏或 payload 非 dict → 空 dict
+    （与上游 DBCache 的容错风格一致：缓存坏了不要拖垮工具调用）。
+    """
+    global _voice_transcription_cache
+    with _voice_transcription_cache_lock:
+        if _voice_transcription_cache is not None:
+            return _voice_transcription_cache
+        if not os.path.exists(VOICE_TRANSCRIPTION_CACHE_FILE):
+            _voice_transcription_cache = {}
+            return _voice_transcription_cache
+        try:
+            with open(VOICE_TRANSCRIPTION_CACHE_FILE, encoding="utf-8") as f:
+                loaded = json.load(f)
+            _voice_transcription_cache = loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            _voice_transcription_cache = {}
+        return _voice_transcription_cache
+
+
+def _save_voice_transcription_cache():
+    """持久化缓存到磁盘。
+
+    - 原子写：先写 .tmp 再 os.replace，避免 crash 中途留下半截文件。
+    - 未加载过也允许保存：此时把 module 状态初始化为空 dict，避免上层
+      代码因调用顺序错误而静默丢数据。
+    - OSError 不抛：避免转录成功但落盘失败时让工具调用也失败；但首次
+      失败会在 stderr 打一行警告，用户知道磁盘满 / 权限问题需要处理。
+    """
+    global _voice_transcription_cache, _voice_transcription_save_warned
+    with _voice_transcription_cache_lock:
+        if _voice_transcription_cache is None:
+            _voice_transcription_cache = {}
+        tmp_path = VOICE_TRANSCRIPTION_CACHE_FILE + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(_voice_transcription_cache, f, ensure_ascii=False)
+            os.replace(tmp_path, VOICE_TRANSCRIPTION_CACHE_FILE)
+        except OSError as exc:
+            if not _voice_transcription_save_warned:
+                print(
+                    f"[voice_cache] 写入失败（后续不再提示）: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _voice_transcription_save_warned = True
+            # 清理可能残留的 .tmp
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+DEFAULT_WHISPER_MODEL = "base"
+
 _whisper_model = None
 
-def _get_whisper_model(model_size="base"):
+def _get_whisper_model(model_size=DEFAULT_WHISPER_MODEL):
     global _whisper_model
     if _whisper_model is None:
         import whisper
@@ -1904,8 +1987,10 @@ def _get_whisper_model(model_size="base"):
 def transcribe_voice(chat_name: str, local_id: int) -> str:
     """将微信语音消息转录为文字（自动检测语言，保留原语言）。
 
-    会先解码 SILK 语音为 WAV，再用 Whisper 转录。
-    首次运行会下载 Whisper 模型（约 145MB）。
+    首次转录会先解码 SILK 语音为 WAV，再用 Whisper 转录；结果缓存到
+    voice_transcriptions.json，重复调用直接返回缓存（跳过 SILK 解码
+    和 Whisper 推理）。若 Whisper 默认模型升级（如 base → small），
+    旧条目自动视为失效并重新转录。首次运行会下载 Whisper 模型（约 145MB）。
 
     依赖: pip install silk-python openai-whisper (silk-python 的 import 名为 pysilk)
 
@@ -1913,6 +1998,29 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
         chat_name: 聊天对象的名字、备注名或wxid
         local_id: 语音消息的 local_id（从 get_voice_messages 获取）
     """
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    cache_key = _voice_transcription_cache_key(username, local_id)
+    cache = _load_voice_transcription_cache()
+    entry = cache.get(cache_key)
+    if (
+        isinstance(entry, dict)
+        and "text" in entry
+        and entry.get("model_size") == DEFAULT_WHISPER_MODEL
+    ):
+        # 命中缓存：跳过 DB 查询、SILK 解码、Whisper 推理。
+        # 条目里存了 create_time，即使源 DB 中消息已被清理仍能返回历史转录。
+        lang = entry.get("language", "unknown")
+        cached_ts = entry.get("create_time")
+        if isinstance(cached_ts, int):
+            time_label = datetime.fromtimestamp(cached_ts).strftime('%Y-%m-%d %H:%M')
+        else:
+            time_label = "-"
+        return f"[{time_label}] ({lang})\n{entry['text']}"
+
+    # 未命中：只有这条路径才需要 whisper / pysilk。
     try:
         import whisper  # noqa: F401
     except ImportError:
@@ -1921,10 +2029,6 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
         import pysilk  # noqa: F401
     except ImportError:
         return "缺少依赖: pip install silk-python"
-
-    username = resolve_username(chat_name)
-    if not username:
-        return f"找不到聊天对象: {chat_name}"
 
     row = _fetch_voice_row(username, local_id)
     if row is None:
@@ -1937,6 +2041,16 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
     result = model.transcribe(wav_path)
     lang = result.get("language", "unknown")
     text = result.get("text", "").strip()
+
+    # 写缓存：即使 text 为空也缓存（Whisper 偶尔对静音/极短片段返回空），
+    # 配合 model_size 字段，升级模型后会自动重转，避免永久钉死空结果。
+    cache[cache_key] = {
+        "text": text,
+        "language": lang,
+        "create_time": int(create_time),
+        "model_size": DEFAULT_WHISPER_MODEL,
+    }
+    _save_voice_transcription_cache()
 
     time_label = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M')
     return f"[{time_label}] ({lang})\n{text}"

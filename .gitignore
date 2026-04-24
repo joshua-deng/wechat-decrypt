@@ -27,3 +27,4 @@ Thumbs.db
 # Compiled binaries and output
 find_all_keys_macos
 decoded_voices/
+voice_transcriptions.json
