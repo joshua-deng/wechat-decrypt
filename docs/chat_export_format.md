@@ -19,6 +19,7 @@
 ```json
 {
   "chat": "<display name>",
+  "username": "<wxid 或 @chatroom>",
   "exported_at": "YYYY-MM-DD HH:MM:SS",
   "is_group": true,
   "messages": [ ... ]
@@ -26,6 +27,8 @@
 ```
 
 - `chat` —— 聊天的显示名（联系人名或群名）。
+- `username` —— 稳定的 WeChat 用户名（1-on-1 聊天为 `wxid_*`，群聊为 `*@chatroom`）。
+  `transcribe_chat.py` 会优先读取本字段而非基于 `chat` 再次模糊匹配，避免同名联系人漂移。
 - `exported_at` —— 本地时间字符串，仅作溯源用途。
 - `is_group` —— **仅**群聊出现且为 `true`；1-on-1 聊天时省略。
 - `messages` —— 消息数组，跨所有 DB 分片按时间由旧到新排序。

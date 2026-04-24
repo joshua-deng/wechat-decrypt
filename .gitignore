@@ -9,8 +9,9 @@ decoded_images/
 *.db-wal
 *.db.tmp_monitor
 
-# Chat exports and other local JSON dumps (may contain private data)
-*.json
+# Chat export/transcription output files (contain private message data)
+*_export*.json
+*_transcribed*.json
 
 # Hook outputs
 hook_output.txt

@@ -1,33 +1,30 @@
 """
-Fill in transcriptions for voice messages in a chat export JSON.
+为聊天导出 JSON 中的语音消息补齐转录文本。
 
-Usage:
+用法:
     .venv/bin/python3 transcribe_chat.py <input.json> [output.json]
 
-Arguments:
-    <input.json>   JSON file produced by export_chat.py.
-    [output.json]  Optional output path. Defaults to "<input>_transcribed.json".
+参数:
+    <input.json>   由 export_chat.py 产出的 JSON。
+    [output.json]  可选输出路径，默认 "<input>_transcribed.json"。
 
-Example (full workflow):
+完整流程示例:
     .venv/bin/python3 export_chat.py <chat_name> /tmp/chat.json
     .venv/bin/python3 transcribe_chat.py /tmp/chat.json /tmp/chat_transcribed.json
 
-Behavior:
-    - Transcribes each voice message via OpenAI Whisper (CPU, single-threaded).
-    - Idempotent: messages that already have a "transcription" field are skipped,
-      so re-running after a crash or on a partially-transcribed file is safe.
-    - Crash-safe: the output JSON is rewritten after every message, so progress
-      is preserved if the process is interrupted.
-    - First run downloads the Whisper model (~145 MB) and caches it.
+行为说明:
+    - 使用 OpenAI Whisper (CPU，单线程) 对每条语音消息转录。
+    - 幂等: 已有 "transcription" 字段的消息会被跳过，因此崩溃/中断后可安全重跑。
+    - 崩溃安全: 每处理完一条即整体重写输出 JSON，进程中断最多丢失当前一条。
+    - 首次运行会下载 Whisper 模型 (~145 MB) 并缓存。
 
-Requires the WeChat DBs to still be present/decrypted — the voice blobs are
-re-read from the DB (not from the export JSON).
+需要 WeChat DB 仍然在线/已解密 —— 语音 blob 是从 DB 现场按 local_id 读取的，
+不从 JSON 读。
 """
-import io
 import json
 import os
 import sys
-import wave
+from datetime import datetime
 
 import mcp_server
 
@@ -55,8 +52,11 @@ def transcribe_export(input_path, output_path):
     with open(input_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    chat_name = data["chat"]
-    username = mcp_server.resolve_username(chat_name)
+    # 优先使用导出 JSON 中已记录的 username，避免重新模糊匹配导致同名联系人漂移。
+    username = data.get("username")
+    chat_name = data.get("chat", "")
+    if not username:
+        username = mcp_server.resolve_username(chat_name)
     if not username:
         print(f"Could not resolve username for: {chat_name}")
         sys.exit(1)
@@ -77,9 +77,8 @@ def transcribe_export(input_path, output_path):
 
     for i, msg in enumerate(pending, 1):
         local_id = msg["local_id"]
-        import datetime as _dt
         ts = msg["timestamp"]
-        ts_str = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ts
+        ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ts
         print(f"[{i}/{total}] local_id={local_id} ({ts_str}) ... ", end="", flush=True)
         result = _transcribe_local_id(username, local_id)
         msg["transcription"] = result

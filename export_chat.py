@@ -1,37 +1,38 @@
 """
-Export all messages for a given chat to JSON.
+将单个聊天的全部消息导出为 JSON。
 
-Usage:
+用法:
     .venv/bin/python3 export_chat.py <chat_name> [output.json]
 
-Arguments:
-    <chat_name>    Contact display name, remark name, group name, or wxid.
-    [output.json]  Optional output path. Defaults to "<chat_name>_export.json".
+参数:
+    <chat_name>    联系人显示名、备注名、群名或 wxid。
+    [output.json]  可选输出路径，默认 "<chat_name>_export.json"。
 
-Example:
+示例:
     .venv/bin/python3 export_chat.py <contact_name>
     .venv/bin/python3 export_chat.py <group_name> /tmp/out.json
 
-Output is a JSON file with shape:
+输出 JSON 的紧凑结构:
     {
       "chat": "<display name>",
+      "username": "<wxid 或 @chatroom>",
       "exported_at": "YYYY-MM-DD HH:MM:SS",
-      "is_group": true,          // only present for groups
+      "is_group": true,          // 仅群聊出现
       "messages": [
         {"local_id": 1, "timestamp": 1713..., "sender": "me", "content": "..."},
         {"local_id": 2, "timestamp": 1713..., "sender": "<name>", "type": "voice"}
       ]
     }
 
-Defaults/nulls are omitted: "type" is absent for text messages, "content" is
-absent when nothing extractable, "is_group" is absent for 1-on-1 chats.
+默认值/空值会被省略: text 消息省略 "type"，无可提取内容时省略 "content"，
+1-on-1 聊天省略 "is_group"。
 
-Voice messages are exported as type "voice" without a transcription field.
-Run transcribe_chat.py on the output to fill in Whisper transcriptions.
+语音消息以 type "voice" 导出且不带 transcription 字段；运行
+transcribe_chat.py 可用 Whisper 补齐转录。
 
-Requires the WeChat DBs to already be decrypted (see README).
+需先完成 WeChat DB 解密（详见 README）。
 
-Full schema, field semantics, and loading examples: docs/chat_export_format.md
+完整 schema、字段语义与加载示例: docs/chat_export_format.md
 """
 import json
 import sqlite3
@@ -88,7 +89,13 @@ def _resolve_sender(row, ctx, names, id_to_username):
 
 def _decode_sticker_desc(b64_desc):
     """WeChat encodes sticker labels as base64 protobuf: repeated (lang, text) pairs.
-    Returns the 'default' language label (usually Chinese), or None."""
+    Returns the 'default' language label (usually Chinese), or None.
+
+    Limitation: treats the length byte as a single octet rather than a real protobuf
+    varint — labels >127 bytes would be misread. In practice sticker descriptions are
+    short (<30 chars), so this is adequate. Also sensitive to the bytes b"default"
+    appearing inside a preceding value; no such cases observed.
+    """
     import base64
     try:
         raw = base64.b64decode(b64_desc)
@@ -168,6 +175,19 @@ def _extract_content(local_id, local_type, content, ct, chat_username, chat_disp
 
 def export_chat(chat_name, output_path):
     ctx = mcp_server._resolve_chat_context(chat_name)
+    if ctx is None:
+        print(f"Could not resolve chat: {chat_name}")
+        sys.exit(1)
+
+    username = ctx["username"]
+    display_name = ctx["display_name"]
+    # resolve_username 对模糊匹配会静默选第一个命中，打印一下便于用户核对。
+    print(f"Resolved to: {display_name} ({username})")
+
+    if not ctx["message_tables"]:
+        print(f"No message tables found for {username}")
+        sys.exit(1)
+
     names = mcp_server.get_contact_names()
 
     # Each shard has its own Name2Id table, so we must pair rows with the
@@ -178,15 +198,12 @@ def export_chat(chat_name, output_path):
         table_name = table_info["table_name"]
         with closing(sqlite3.connect(db_path)) as conn:
             id_to_username = mcp_server._load_name2id_maps(conn)
-            rows = mcp_server._query_messages(conn, table_name, limit=999999, oldest_first=True)
+            rows = mcp_server._query_messages(conn, table_name, limit=None, oldest_first=True)
             for row in rows:
                 all_rows.append((row, id_to_username))
 
-    # Sort across shards by create_time
-    all_rows.sort(key=lambda pair: pair[0][2])
-
-    username = ctx["username"]
-    display_name = ctx["display_name"]
+    # Sort across shards by create_time (defensive "or 0" in case a row has NULL).
+    all_rows.sort(key=lambda pair: pair[0][2] or 0)
 
     messages = []
     for row, id_to_username in all_rows:
@@ -210,6 +227,7 @@ def export_chat(chat_name, output_path):
 
     output = {
         "chat": display_name,
+        "username": username,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "messages": messages,
     }
