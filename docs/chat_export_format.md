@@ -1,21 +1,20 @@
-# Chat Export JSON Format
+# 聊天导出 JSON 数据格式
 
-Files produced by `export_chat.py` and `transcribe_chat.py` use a compact schema
-where defaults and nulls are omitted. This document describes how to load and
-interpret those files.
+`export_chat.py` 与 `transcribe_chat.py` 生成的 JSON 文件采用紧凑格式：
+默认值与空值会被省略。本文档说明如何加载和解读这类文件。
 
-## Producing a file
+## 生成文件
 
 ```bash
 .venv/bin/python3 export_chat.py <chat_name> [output.json]
 .venv/bin/python3 transcribe_chat.py <input.json> [output.json]
 ```
 
-`export_chat.py` writes the raw export; `transcribe_chat.py` fills in
-transcriptions for voice messages (Whisper, CPU). Re-running `transcribe_chat.py`
-is safe — already-transcribed messages are skipped.
+`export_chat.py` 负责原始导出；`transcribe_chat.py` 使用 Whisper（CPU）
+为语音消息填充转录文本。`transcribe_chat.py` 可重复运行 —— 已转录的
+消息会被跳过。
 
-## Top-level shape
+## 顶层结构
 
 ```json
 {
@@ -26,31 +25,30 @@ is safe — already-transcribed messages are skipped.
 }
 ```
 
-- `chat` — display name of the chat (contact name or group name).
-- `exported_at` — local timestamp string, for provenance only.
-- `is_group` — present and `true` **only** for group chats; absent for 1-on-1.
-- `messages` — array sorted oldest → newest across all DB shards.
+- `chat` —— 聊天的显示名（联系人名或群名）。
+- `exported_at` —— 本地时间字符串，仅作溯源用途。
+- `is_group` —— **仅**群聊出现且为 `true`；1-on-1 聊天时省略。
+- `messages` —— 消息数组，跨所有 DB 分片按时间由旧到新排序。
 
-Count is `len(messages)`; there is no `total` field.
+消息条数 = `len(messages)`，没有 `total` 字段。
 
-## Message object
+## 消息对象
 
-Every message carries three required keys: `local_id`, `timestamp`, `sender`.
-All other keys are **optional** and omitted when they would carry a default or
-null value.
+每条消息必有三个字段：`local_id`、`timestamp`、`sender`。
+其余字段均为**可选**，当值为默认值或 null 时会被省略。
 
-| Key             | Type    | Required | Meaning / default when absent                                                                                                        |
-| --------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `local_id`      | int     | yes      | Stable WeChat row id within this chat. Use for matching when re-transcribing or diffing exports.                                     |
-| `timestamp`     | int     | yes      | Unix epoch seconds (local wall time → seconds). Convert with `datetime.fromtimestamp(ts)`.                                           |
-| `sender`        | string  | yes      | `"me"` = logged-in user. Otherwise the sender's display name — the contact's name in 1-on-1 chats, the member's name in groups. `""` for unattributable messages (e.g. system notifications). |
-| `type`          | string  | no       | Message type. **Absent ⇒ `"text"`.** Known values: `text`, `image`, `voice`, `sticker`, `video`, `link_or_file`, `call`, `system`, `recall`, `contact_card`, `location`. |
-| `content`       | string  | no       | Rendered text of the message. Absent when nothing extractable (e.g. some images / calls / system events).                            |
-| `transcription` | string  | no       | Present **only** on `type: "voice"` messages that have been transcribed. May be an empty string `""` if Whisper produced nothing.     |
+| 字段            | 类型   | 必填 | 含义 / 缺失时的默认值                                                                                                                                         |
+| --------------- | ------ | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `local_id`      | int    | 是   | WeChat 内该聊天的稳定行 ID。用于重跑转录或对比导出时的消息匹配。                                                                                              |
+| `timestamp`     | int    | 是   | Unix 时间戳（秒级，本地时间已换算为秒）。通过 `datetime.fromtimestamp(ts)` 转换。                                                                             |
+| `sender`        | string | 是   | `"me"` 代表当前登录用户；否则为发送者的显示名 —— 1-on-1 聊天中是联系人名，群聊中是群成员名。对于无法归属的消息（如系统通知）为 `""`。                         |
+| `type`          | string | 否   | 消息类型。**缺失时视为 `"text"`**。已知取值：`text`、`image`、`voice`、`sticker`、`video`、`link_or_file`、`call`、`system`、`recall`、`contact_card`、`location`。 |
+| `content`       | string | 否   | 消息的渲染文本。当没有可提取内容时省略（例如部分图片 / 通话 / 系统事件）。                                                                                    |
+| `transcription` | string | 否   | **仅**在 `type: "voice"` 且已完成转录的消息上出现。若 Whisper 未产出文本可能为空串 `""`。                                                                     |
 
-## Loading examples
+## 加载示例
 
-Iterate with defaults applied:
+带默认值的遍历：
 
 ```python
 import json
@@ -64,36 +62,33 @@ is_group = data.get("is_group", False)
 for m in data["messages"]:
     mtype = m.get("type", "text")
     when = datetime.fromtimestamp(m["timestamp"])
-    sender = m["sender"]  # "me" | contact/member name | ""
+    sender = m["sender"]  # "me" | 联系人/群成员名 | ""
     text = m.get("content", "")
     if mtype == "voice":
         text = m.get("transcription") or "[voice, untranscribed]"
     print(f"[{when:%Y-%m-%d %H:%M}] {sender or '(system)'}: {text}")
 ```
 
-Determine "sent by me":
+判断消息是否由自己发出：
 
 ```python
 from_me = m["sender"] == "me"
 ```
 
-Filter only voice messages that still need transcription:
+筛选仍需转录的语音消息：
 
 ```python
 pending = [m for m in data["messages"]
            if m.get("type") == "voice" and not m.get("transcription")]
 ```
 
-## Notes on interpretation
+## 解读注意事项
 
-- **System messages** (`type: "system"`) have `sender: ""` — they're not "from"
-  anyone. Typical content: recall notifications ("X 撤回了一条消息"), add-friend
-  events, etc.
-- **Empty transcription** (`transcription: ""`) means Whisper ran but produced
-  no text — usually a very short or silent clip. It's distinct from "not yet
-  transcribed" (field absent).
-- **`content` for non-text types** is a rendered summary: `[视频] 12秒`,
-  `[表情] 哈哈`, `[图片]`, etc. The raw media is still in the WeChat DB; see
-  `mcp_server.py` helpers (`decode_image`, `decode_voice`) to extract it.
-- **Group chats**: `sender` is the member's resolved display name; the
-  logged-in user is still `"me"`.
+- **系统消息**（`type: "system"`）的 `sender` 为 `""` —— 不属于任何人。
+  常见内容：撤回通知（"X 撤回了一条消息"）、添加好友事件等。
+- **空转录**（`transcription: ""`）表示 Whisper 已经运行但未产出文本，
+  通常是极短或静音片段。这与"尚未转录"（字段缺失）是不同的状态。
+- **非文本消息的 `content`** 是渲染摘要：`[视频] 12秒`、`[表情] 哈哈`、
+  `[图片]` 等。原始媒体仍在 WeChat DB 中，可用 `mcp_server.py` 中的
+  辅助函数（`decode_image`、`decode_voice`）取出。
+- **群聊**中的 `sender` 是群成员解析后的显示名；当前登录用户仍为 `"me"`。
