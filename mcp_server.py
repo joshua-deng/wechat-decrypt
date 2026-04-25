@@ -1664,7 +1664,12 @@ def get_new_messages() -> str:
 
 # ============ 图片解密 ============
 
-_image_resolver = ImageResolver(WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache)
+_image_aes_key = _cfg.get("image_aes_key")  # V2 格式 AES key (从微信内存提取)
+_image_xor_key = _cfg.get("image_xor_key", 0x88)
+_image_resolver = ImageResolver(
+    WECHAT_BASE_DIR, DECODED_IMAGE_DIR, _cache,
+    aes_key=_image_aes_key, xor_key=_image_xor_key,
+)
 
 
 @mcp.tool()

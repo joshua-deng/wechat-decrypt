@@ -118,7 +118,7 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
         dat_path: V2 .dat 文件路径
         out_path: 输出路径 (None 则自动命名)
         aes_key: 16 字节 AES key (bytes 或 str)
-        xor_key: XOR key (int, 默认 0x88)
+        xor_key: XOR key (int 或可被 int(_, 0) 解析的 str, 默认 0x88)
 
     Returns:
         (output_path, format) 或 (None, None)
@@ -134,6 +134,10 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
         aes_key = aes_key.encode('ascii')[:16]
     if len(aes_key) < 16:
         return None, None
+
+    # 与 aes_key 的 str→bytes 处理对称: 允许 config.json 写 "0x88" / "136" 等字符串形式
+    if isinstance(xor_key, str):
+        xor_key = int(xor_key, 0)
 
     with open(dat_path, 'rb') as f:
         data = f.read()
@@ -299,17 +303,21 @@ def extract_md5_from_packed_info(blob):
 class ImageResolver:
     """封装从 local_id 到图片文件的完整解析链"""
 
-    def __init__(self, wechat_base_dir, decoded_image_dir, cache):
+    def __init__(self, wechat_base_dir, decoded_image_dir, cache, aes_key=None, xor_key=0x88):
         """
         Args:
             wechat_base_dir: 微信数据根目录 (如 D:\\xwechat_files\\<wxid>)
             decoded_image_dir: 解密图片输出目录
             cache: DBCache 实例，用于解密 message_resource.db
+            aes_key: V2 格式的 AES key (16 字节 str/bytes)，None 表示不支持 V2 文件
+            xor_key: XOR key (int, 默认 0x88)，用于 V2 文件的 XOR 段
         """
         self.base_dir = wechat_base_dir
         self.attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
         self.out_dir = decoded_image_dir
         self.cache = cache
+        self.aes_key = aes_key
+        self.xor_key = xor_key
 
     def get_image_md5(self, local_id):
         """通过 local_id 查 message_resource.db 获取图片文件 MD5"""
@@ -379,13 +387,17 @@ class ImageResolver:
                 selected = f
                 break
 
-        # 3. 解密
+        # 3. 解密 (decrypt_dat_file 会按 magic 自动分发 V2 / V1 / 老 XOR)
         out_name = f"{file_md5}"
         out_path_base = os.path.join(self.out_dir, out_name)
 
-        result_path, fmt = xor_decrypt_file(selected, f"{out_path_base}.tmp")
+        # 提前拦截以给出具体错误信息;否则会在 v2_decrypt_file 内 silent-fail 成笼统的"解密失败"
+        if is_v2_format(selected) and not self.aes_key:
+            return {'success': False, 'error': f'V2 格式 .dat 文件需要 AES key (文件: {selected})', 'md5': file_md5}
+
+        result_path, fmt = decrypt_dat_file(selected, f"{out_path_base}.tmp", self.aes_key, self.xor_key)
         if not result_path:
-            return {'success': False, 'error': f'无法检测 XOR key (文件: {selected})', 'md5': file_md5}
+            return {'success': False, 'error': f'解密失败 (文件: {selected})', 'md5': file_md5}
 
         # 重命名为正确扩展名
         final_path = f"{out_path_base}.{fmt}"
