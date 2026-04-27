@@ -198,11 +198,19 @@ def load_config():
     else:
         cfg = {**_DEFAULT, **cfg}
 
-    # 将相对路径转为绝对路径
+    # 路径展开:先 expanduser(~ 展开)+ expandvars($HOME / %USERPROFILE% 展开),
+    # 再判 isabs;还相对就 join 项目根。这样 config 里既能写
+    # "all_keys.json"(项目根相对),也能写 "~/Documents/wechat_decrypted" /
+    # "$HOME/wechat" / "%USERPROFILE%\\wechat"(跨用户便携)。
+    # 空字串 / null 不再触发 TypeError(用 cfg.get 而非 in)。
     base = os.path.dirname(os.path.abspath(__file__))
+    if cfg.get("db_dir"):
+        cfg["db_dir"] = os.path.expanduser(os.path.expandvars(cfg["db_dir"]))
     for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
-        if key in cfg and not os.path.isabs(cfg[key]):
-            cfg[key] = os.path.join(base, cfg[key])
+        if cfg.get(key):
+            cfg[key] = os.path.expanduser(os.path.expandvars(cfg[key]))
+            if not os.path.isabs(cfg[key]):
+                cfg[key] = os.path.join(base, cfg[key])
 
     # 自动推导微信数据根目录（db_dir 的上级目录）
     # db_dir 格式: D:\xwechat_files\<wxid>\db_storage
