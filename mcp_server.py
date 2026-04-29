@@ -566,7 +566,7 @@ def _parse_xml_root(content):
 
 
 # 合并转发的 recorditem 内嵌 XML 在 dataitem 数量多时显著超过 20K，
-# 实测含 99 条 dataitem 的卡片可达 ~50KB，用更宽的上限专门解析。
+# 实测含 99 条 dataitem 的卡片可达 ~418KB，用更宽的上限专门解析。
 _RECORD_XML_PARSE_MAX_LEN = 500_000
 
 
@@ -1848,14 +1848,14 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
 
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
-            f"SELECT local_type, message_content, WCDB_CT_message_content "
+            f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
             f"FROM [{table_name}] WHERE local_id=?",
             (local_id,)
         ).fetchone()
     if not row:
         return f"找不到 local_id={local_id} 的消息"
 
-    local_type, content, ct_compress = row
+    local_type, create_time, content, ct_compress = row
     base_type, _ = _split_msg_type(local_type)
     if base_type != 49:
         return (
@@ -1886,28 +1886,57 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
     if not title:
         return "消息中没有文件名 (title)"
 
+    # 性能优化：先按消息时间精确定位 msg/file/{YYYY-MM}/，命中即返回；
+    # 否则才退回 walk 全盘 os.walk（msg/attach 含数十万小文件，全盘扫描可达数秒）
+    import glob as glob_mod
     candidates = []
-    for sub_dir in ('msg/file', 'msg/attach'):
-        d = os.path.join(WECHAT_BASE_DIR, sub_dir)
-        if not os.path.isdir(d):
-            continue
-        for root_dir, _, files in os.walk(d):
-            for f in files:
-                if f.startswith('.'):
-                    continue
-                full = os.path.join(root_dir, f)
-                if f == title:
-                    candidates.append(full)
-                    continue
-                # 处理同名重复加 (1)(2) 后缀，按 size 二次确认
-                if totallen:
-                    try:
-                        if os.path.getsize(full) == totallen:
-                            stem = os.path.splitext(title)[0]
-                            if stem and stem in f:
-                                candidates.append(full)
-                    except OSError:
-                        pass
+    msg_file_dir = os.path.join(WECHAT_BASE_DIR, 'msg/file')
+    if create_time and os.path.isdir(msg_file_dir):
+        # 同名文件可能落到收到消息的当月、上一月或下一月（罕见跨月边界）
+        from datetime import datetime as _dt, timedelta as _td
+        ts_dt = _dt.fromtimestamp(create_time)
+        candidate_months = {
+            ts_dt.strftime('%Y-%m'),
+            (ts_dt - _td(days=31)).strftime('%Y-%m'),
+            (ts_dt + _td(days=31)).strftime('%Y-%m'),
+        }
+        escaped_stem = glob_mod.escape(os.path.splitext(title)[0])
+        ext = os.path.splitext(title)[1]
+        for ym in candidate_months:
+            month_dir = os.path.join(msg_file_dir, ym)
+            if not os.path.isdir(month_dir):
+                continue
+            # 精确匹配 + 同名 (1)(2) 后缀变体
+            for pattern in (
+                glob_mod.escape(title),
+                f"{escaped_stem}*{glob_mod.escape(ext)}" if ext else f"{escaped_stem}*",
+            ):
+                for hit in glob_mod.glob(os.path.join(month_dir, pattern)):
+                    if hit not in candidates:
+                        candidates.append(hit)
+
+    # 退路：未命中或没 create_time 时全盘 walk（slow path，保留原始行为兜底）
+    if not candidates:
+        for sub_dir in ('msg/file', 'msg/attach'):
+            d = os.path.join(WECHAT_BASE_DIR, sub_dir)
+            if not os.path.isdir(d):
+                continue
+            for root_dir, _, files in os.walk(d):
+                for f in files:
+                    if f.startswith('.'):
+                        continue
+                    full = os.path.join(root_dir, f)
+                    if f == title:
+                        candidates.append(full)
+                        continue
+                    if totallen:
+                        try:
+                            if os.path.getsize(full) == totallen:
+                                stem = os.path.splitext(title)[0]
+                                if stem and stem in f:
+                                    candidates.append(full)
+                        except OSError:
+                            pass
 
     if not candidates:
         return (
@@ -1979,7 +2008,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
         return f"找不到 local_id={local_id} 的消息"
 
     local_type, content, ct_compress = row
-    base_type, sub_type_packed = _split_msg_type(local_type)
+    base_type, _ = _split_msg_type(local_type)
     if base_type != 49:
         return (
             f"不是合并转发消息（local_type={local_type}, base_type={base_type}），"
@@ -2033,7 +2062,8 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
         '1': '文本', '2': '图片', '3': '名片', '4': '语音',
         '5': '视频', '6': '链接', '7': '位置', '8': '文件',
         '17': '聊天记录', '19': '小程序', '22': '视频号',
-        '29': '音乐', '37': '表情包',
+        '23': '视频号直播', '29': '音乐', '36': '小程序/H5',
+        '37': '表情包',
     }.get(datatype, f'datatype={datatype}')
 
     if datatype == '1':
