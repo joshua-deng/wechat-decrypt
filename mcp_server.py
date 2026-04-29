@@ -449,7 +449,12 @@ def _decompress_content(content, ct):
 
 
 def _parse_message_content(content, local_type, is_group):
-    """解析消息内容，返回 (sender_id, text)"""
+    """解析消息内容，返回 (sender_id, text)。
+
+    群消息 content 形如 'wxid_xxx:\n<xml...>'；但 Codex round-7 实测发现
+    部分 type=19 合并转发也会写成 'wxid_xxx:<?xml...' 或 'wxid_xxx:<msg...'
+    不带换行 → 必须扩展剥离逻辑。
+    """
     if content is None:
         return '', ''
     if isinstance(content, bytes):
@@ -457,8 +462,15 @@ def _parse_message_content(content, local_type, is_group):
 
     sender = ''
     text = content
-    if is_group and ':\n' in content:
-        sender, text = content.split(':\n', 1)
+    if is_group:
+        if ':\n' in content:
+            sender, text = content.split(':\n', 1)
+        else:
+            # 'sender:<?xml...' / 'sender:<msg...' 等无换行 case
+            m = re.match(r'^([A-Za-z0-9_\-@.]+):(<\?xml|<msg|<msglist|<voipmsg|<sysmsg)', content)
+            if m:
+                sender = m.group(1)
+                text = content[len(sender) + 1:]
 
     return sender, text
 
@@ -2109,60 +2121,72 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
                 f"  说明：找到了同名文件但 size 都不匹配——可能从未真正下载完整 / 已被清理"
             )
 
-    # 没有 md5 = 没法 cryptographic 证明候选属于该消息 → fail closed。
-    # 之前的 "heuristic + warning" 不够：candidates==1 时 warning 形同虚设，
-    # downstream 会把无关同名同 size 文件当成目标读。Codex round-6 high #1。
+    # 威胁模型：本工具是用户主动通过 MCP 调用，path 只在本地对话显示，调用者
+    # 都是熟人。Codex round-6 强制"没 md5 fail-closed"对此场景过严——
+    # 回退到"有 md5 强校验，没 md5 heuristic + warning"的实用路线（round-5）。
     cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
-    if not (expected_md5 and len(expected_md5) == 32):
+    md5_verified = False
+    if expected_md5 and len(expected_md5) == 32:
+        # 用 md5 过滤候选——同 md5 = 真同一文件副本。
+        md5_match = []
+        md5_errors = []
+        for c in candidates:
+            if not _path_under_root(c, cache_root):
+                md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
+                continue
+            actual_md5, err = _md5_file_chunked(c)
+            if err:
+                md5_errors.append(f"{c}: {err}")
+                continue
+            if actual_md5 == expected_md5:
+                md5_match.append(c)
+        if not md5_match:
+            info = (
+                f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
+                f"  期望 md5: {expected_md5}\n"
+                f"  说明：找到 {len(candidates)} 个同名同 size 的本地文件但 md5 都不对。"
+                f"目标文件可能未在 wechat 客户端打开过，或已被清理。"
+            )
+            if md5_errors:
+                info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
+            return info
+        candidates = md5_match
+        md5_verified = True
+
+    # 没 md5 时多 candidates 仍 fail-closed（避免 silent mtime pick）
+    if len(candidates) > 1 and not md5_verified:
         from datetime import datetime as _dt
         details = []
-        for c in candidates[:5]:
+        for c in candidates:
             try:
                 mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
             except OSError:
                 mt = '?'
             details.append(f"{c} (mtime={mt})")
-        more = "" if len(candidates) <= 5 else f"\n  …还有 {len(candidates) - 5} 个候选"
         return (
-            f"消息 XML 没含 md5 字段，本工具拒绝基于 (filename+size) 启发式返回路径"
-            f"（避免 silent 命中无关消息的同名缓存）:\n  "
+            f"在本地缓存找到 {len(candidates)} 个匹配的副本，无法唯一定位"
+            f"（同名同 size 多份，且消息 XML 没含 md5 用于强校验）:\n  "
             + '\n  '.join(details)
-            + more
-            + f"\n如确实需要这个文件，请人工 inspect 候选并直接 Read 你认可的 path"
+            + f"\n请人工 inspect mtime / 上下文区分"
         )
 
-    # 用 expected_md5 过滤 candidates；同 md5 = 真同一文件副本。
-    md5_match = []
-    md5_errors = []
-    for c in candidates:
-        if not _path_under_root(c, cache_root):
-            md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
-            continue
-        actual_md5, err = _md5_file_chunked(c)
-        if err:
-            md5_errors.append(f"{c}: {err}")
-            continue
-        if actual_md5 == expected_md5:
-            md5_match.append(c)
-    if not md5_match:
-        info = (
-            f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
-            f"  期望 md5: {expected_md5}\n"
-            f"  说明：找到 {len(candidates)} 个同名同 size 的本地文件但 md5 都不对。"
-            f"目标文件可能未在 wechat 客户端打开过，或已被清理。"
-        )
-        if md5_errors:
-            info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
-        return info
+    chosen = candidates[0]
+    if not _path_under_root(chosen, cache_root):
+        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
 
-    chosen = md5_match[0]
+    binding_note = (
+        "✅ md5 校验通过，路径与消息唯一绑定"
+        if md5_verified else
+        f"⚠️  消息 XML 没含 md5，路径基于 (filename+size) 启发式匹配——"
+        f"如果同 chat 缓存里另有同名同 size 的不相关文件，可能返回错副本，请人工验证。"
+    )
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  扩展名: {fileext or os.path.splitext(title)[1].lstrip('.') or '?'}\n"
         f"  期望大小: {totallen:,} bytes\n"
-        f"  ✅ md5 校验通过，路径与消息唯一绑定"
+        f"  {binding_note}"
     )
 
 
@@ -2337,8 +2361,28 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         sub = subdir_map.get(datatype, '*')
         idx_str = str(item_index)
 
-        # 精确文件名 + size 严格匹配（datatitle 可能含 glob 元字符，必须 escape）
-        if datatitle:
+        # datatype=2 图片走 flat 文件命名 (Img/0_t / Img/0 / Img/0.{ext})，
+        # 不像文件类的 F/{idx}/{filename}。Codex round-7 medium #2 实测纠正。
+        if datatype == '2':
+            flat_patterns = [
+                f"{idx_str}_t",
+                idx_str,
+                f"{idx_str}.*",
+                f"{idx_str}_*",
+            ]
+            for fp in flat_patterns:
+                for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, fp)):
+                    if datasize:
+                        try:
+                            if os.path.getsize(hit) != datasize:
+                                continue
+                        except OSError:
+                            continue
+                    if hit not in candidates:
+                        candidates.append(hit)
+
+        # 文件 / 视频 / 语音类: F|V|A/{idx}/{filename}
+        if datatype != '2' and datatitle:
             escaped_title = glob_mod.escape(datatitle)
             for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, escaped_title)):
                 if datasize:
@@ -2350,11 +2394,8 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
                 if hit not in candidates:
                     candidates.append(hit)
 
-        # size only 兜底：仅在 datatitle 缺失（如 datatype=2 图片缩略图无标题）时启用，
-        # 限定在 sub-dir + item_index 子树内，避免跨多个 Rec 目录混合无关 record。
-        # 不再做更宽的 cross-subdir 终极兜底——它会让不同合并卡片中同名同 size 的
-        # 文件互相 leak，silent 返回错的 record。Codex round-2 high #2。
-        if not candidates and not datatitle and datasize:
+        # size only 兜底：仅在 datatitle 缺失且非 image（image 已上面处理）时启用
+        if not candidates and not datatitle and datasize and datatype != '2':
             for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, '*')):
                 try:
                     if os.path.getsize(hit) == datasize:
@@ -2391,53 +2432,64 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
             + f"\n请通过其他途径区分（人工 inspect mtime 或匹配上下文）"
         )
 
+    # 威胁模型：本工具是用户主动通过 MCP 调用 + path 只在本地显示。
+    # 跟 decode_file_message 一致路线：有 md5 强校验，没 md5 fallback 到
+    # heuristic + warning（实用 over 严格）。
     cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
-    # 没 fullmd5 = 没法 cryptographic 证明候选属于该 record → fail closed。
-    # Codex round-6 high #2: candidates==1 时 ⚠️ warning 不能阻止下游使用错路径。
-    if not (expected_md5 and len(expected_md5) == 32):
+    md5_verified = False
+    if expected_md5 and len(expected_md5) == 32:
+        md5_match = []
+        md5_errors = []
+        for c in candidates:
+            if not _path_under_root(c, cache_root):
+                md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
+                continue
+            actual_md5, err = _md5_file_chunked(c)
+            if err:
+                md5_errors.append(f"{c}: {err}")
+                continue
+            if actual_md5 == expected_md5:
+                md5_match.append(c)
+        if not md5_match:
+            info = (
+                f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
+                f"  期望 md5: {expected_md5}\n"
+                f"  说明：候选 {len(candidates)} 个，md5 都不对。"
+                f"目标 dataitem 可能未在 wechat 客户端点开过，请点击第 {item_index + 1} 项触发下载。"
+            )
+            if md5_errors:
+                info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
+            return info
+        candidates = md5_match
+        md5_verified = True
+
+    # 没 fullmd5 时多 candidates 仍 fail-closed
+    if len(candidates) > 1 and not md5_verified:
         from datetime import datetime as _dt
         details = []
-        for c in candidates[:5]:
+        for c in candidates:
             try:
                 mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
             except OSError:
                 mt = '?'
             details.append(f"{c} (mtime={mt})")
-        more = "" if len(candidates) <= 5 else f"\n  …还有 {len(candidates) - 5} 个候选"
         return (
-            f"该 dataitem XML 没含 fullmd5 字段，本工具拒绝基于"
-            f" (item_index+filename+size) 启发式返回路径\n"
-            f"（避免 silent 返回同 chat 内别条 record 的同名同 size 文件）:\n  "
+            f"找到 {len(candidates)} 个匹配的本地副本，无法唯一定位"
+            f"（同位置同名同 size 多份，且 dataitem XML 没含 fullmd5 用于强校验）:\n  "
             + '\n  '.join(details)
-            + more
-            + f"\n如确实需要，请人工 inspect 候选并直接 Read 你认可的 path"
+            + f"\n请人工 inspect mtime / 上下文区分"
         )
 
-    # md5 过滤候选
-    md5_match = []
-    md5_errors = []
-    for c in candidates:
-        if not _path_under_root(c, cache_root):
-            md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
-            continue
-        actual_md5, err = _md5_file_chunked(c)
-        if err:
-            md5_errors.append(f"{c}: {err}")
-            continue
-        if actual_md5 == expected_md5:
-            md5_match.append(c)
-    if not md5_match:
-        info = (
-            f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
-            f"  期望 md5: {expected_md5}\n"
-            f"  说明：候选 {len(candidates)} 个，md5 都不对。"
-            f"目标 dataitem 可能未在 wechat 客户端点开过，请点击第 {item_index + 1} 项触发下载。"
-        )
-        if md5_errors:
-            info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
-        return info
+    chosen = candidates[0]
+    if not _path_under_root(chosen, cache_root):
+        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
 
-    chosen = md5_match[0]
+    binding_note = (
+        "✅ md5 校验通过，路径与 dataitem 唯一绑定"
+        if md5_verified else
+        f"⚠️  此 dataitem XML 没含 fullmd5，路径基于 (item_index+filename+size) 启发式匹配——"
+        f"如果同 chat 内多条合并卡片碰巧含同位置同名同 size 的文件，可能返回别条 record 的副本，请人工验证。"
+    )
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
@@ -2445,7 +2497,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         f"  期望大小: {datasize:,} bytes\n"
         f"  发送者: {sourcename}\n"
         f"  类型: [{type_label}] {datatitle or '(无标题)'}\n"
-        f"  ✅ md5 校验通过，路径与 dataitem 唯一绑定"
+        f"  {binding_note}"
     )
 
 
