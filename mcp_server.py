@@ -2021,22 +2021,40 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
             f"  可能原因：从未在 PC/Mac 微信打开过 / 已被清理"
         )
 
-    # 优先取 size 完全匹配的；并按 mtime 最近排序
-    size_match = [c for c in candidates if totallen and os.path.getsize(c) == totallen]
-    if size_match:
-        candidates = size_match
-    candidates.sort(key=lambda p: -os.path.getmtime(p))
-    chosen = candidates[0]
+    # 严格 size 过滤（如果 totallen 已知，不匹配的全淘汰）
+    if totallen:
+        candidates = [c for c in candidates if os.path.getsize(c) == totallen]
+        if not candidates:
+            return (
+                f"在本地缓存中找不到 {title} (期望 size={totallen:,})\n"
+                f"  说明：找到了同名文件但 size 都不匹配——可能从未真正下载完整 / 已被清理"
+            )
 
-    extra = ""
+    # Fail closed：多 candidates 时报歧义而不是 silent mtime pick。
+    # decode_record_item 的同类问题在 round-2 high #2 已经 fail-closed，
+    # 这里跟它对齐——cross-tool consistency。
     if len(candidates) > 1:
-        extra = f"\n  其他候选: {len(candidates) - 1} 个"
+        from datetime import datetime as _dt
+        details = []
+        for c in candidates:
+            try:
+                mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
+            except OSError:
+                mt = '?'
+            details.append(f"{c} (mtime={mt})")
+        return (
+            f"在本地缓存找到 {len(candidates)} 个匹配的副本，无法唯一定位（同名同 size 多份）:\n  "
+            + '\n  '.join(details)
+            + f"\n请人工 inspect mtime / 上下文区分"
+        )
+
+    chosen = candidates[0]
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  扩展名: {fileext or os.path.splitext(title)[1].lstrip('.') or '?'}\n"
-        f"  期望大小: {totallen:,} bytes" + extra
+        f"  期望大小: {totallen:,} bytes"
     )
 
 
@@ -2179,12 +2197,24 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
             f"  内容: {text_content}"
         )
 
+    # 仅以下 datatype 在 wechat 缓存里有真本地 binary（图片/语音/视频/文件）；
+    # 其他类型如链接/位置/名片/小程序/视频号/嵌套聊天记录等只是 metadata，
+    # 没有可下载的本地副本。**不在白名单里的 datatype 直接拒绝**，避免 sub='*'
+    # 通配命中无关 record 的同名文件。Codex round-3 medium #1。
+    subdir_map = {'8': 'F', '2': 'Img', '5': 'V', '4': 'A'}
+    if datatype not in subdir_map:
+        return (
+            f"该 dataitem 类型 [{type_label}] 没有本地 binary 文件，无需下载\n"
+            f"  发送者: {sourcename}\n"
+            f"  标题: {datatitle or '(无)'}\n"
+            f"  说明：仅 datatype=2/4/5/8（图片/语音/视频/文件）有可下载内容；"
+            f"链接/位置/名片/小程序/视频号/嵌套聊天记录等是 metadata-only。"
+            f"\n如果你需要这条 dataitem 的 metadata 详情，看 get_chat_history 输出里"
+            f"已展开的 [{item_index}] 行内容即可。"
+        )
+
     table_hash = table_name.replace('Msg_', '', 1)
     attach_dir = os.path.join(WECHAT_BASE_DIR, 'msg/attach', table_hash)
-
-    # 文件类（datatype=8）落 F/{idx}/，图片类落 Img/{idx}/，视频类落 V/{idx}/
-    # 提到 if-block 之外，否则下方 not-found 分支引用时会 UnboundLocalError
-    subdir_map = {'8': 'F', '2': 'Img', '5': 'V', '4': 'A'}
 
     candidates = []
     if os.path.isdir(attach_dir):
