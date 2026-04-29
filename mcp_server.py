@@ -594,6 +594,38 @@ def _path_under_root(path, root):
     return real_path == real_root or real_path.startswith(real_root + os.sep)
 
 
+# 大附件 md5 校验时的安全上限：超过此 size 直接拒绝校验（避免 MCP 进程
+# 在 100MB+ 视频/附件上一次性 read() 整文件爆内存或长时间阻塞）。
+_MD5_VERIFY_MAX_SIZE = 500 * 1024 * 1024  # 500 MB
+_MD5_CHUNK_SIZE = 64 * 1024  # 64 KB
+
+
+def _md5_file_chunked(path, max_size=_MD5_VERIFY_MAX_SIZE):
+    """流式分块计算文件 md5，避免大文件一次读完爆内存。
+
+    超过 max_size 直接拒绝（DoS 防御 + 大附件 md5 校验现实意义不大）。
+    返回 (md5_hex, error)；成功时 error 为 None。
+    """
+    import hashlib as _hashlib
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return None, f"无法读取文件 size: {e}"
+    if size > max_size:
+        return None, f"文件 size {size:,} 超过 md5 校验上限 {max_size:,}（防 DoS）"
+    h = _hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(_MD5_CHUNK_SIZE)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError as e:
+        return None, f"读取文件失败: {e}"
+    return h.hexdigest().lower(), None
+
+
 def _parse_xml_root(content, max_len=_XML_PARSE_MAX_LEN):
     if not content or len(content) > max_len or _XML_UNSAFE_RE.search(content):
         return None
@@ -2077,68 +2109,60 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
                 f"  说明：找到了同名文件但 size 都不匹配——可能从未真正下载完整 / 已被清理"
             )
 
-    # md5 强校验提到 ambiguity 判断之前：
-    # 1. 如果 expected_md5 已知 → 用它过滤 candidates。同 md5 = 真同一文件副本（用户重发
-    #    或 wechat 加 (1) 后缀的复制），任选一个都对。剩 0 个则 md5 不匹配。
-    # 2. expected_md5 未知 → 退回 fail-closed：多 candidates 报歧义。
+    # 没有 md5 = 没法 cryptographic 证明候选属于该消息 → fail closed。
+    # 之前的 "heuristic + warning" 不够：candidates==1 时 warning 形同虚设，
+    # downstream 会把无关同名同 size 文件当成目标读。Codex round-6 high #1。
     cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
-    md5_verified = False
-    if expected_md5 and len(expected_md5) == 32:
-        import hashlib as _hashlib
-        md5_match = []
-        for c in candidates:
-            if not _path_under_root(c, cache_root):
-                continue
-            try:
-                with open(c, 'rb') as _f:
-                    actual_md5 = _hashlib.md5(_f.read()).hexdigest().lower()
-                if actual_md5 == expected_md5:
-                    md5_match.append(c)
-            except OSError:
-                continue
-        if not md5_match:
-            return (
-                f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
-                f"  期望 md5: {expected_md5}\n"
-                f"  说明：找到 {len(candidates)} 个同名同 size 的本地文件但 md5 都不对。"
-                f"目标文件可能未在 wechat 客户端打开过，或已被清理。"
-            )
-        candidates = md5_match
-        md5_verified = True
-
-    # md5 不可用时（XML 无 md5 字段），多 candidates 仍 fail-closed
-    if len(candidates) > 1 and not md5_verified:
+    if not (expected_md5 and len(expected_md5) == 32):
         from datetime import datetime as _dt
         details = []
-        for c in candidates:
+        for c in candidates[:5]:
             try:
                 mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
             except OSError:
                 mt = '?'
             details.append(f"{c} (mtime={mt})")
+        more = "" if len(candidates) <= 5 else f"\n  …还有 {len(candidates) - 5} 个候选"
         return (
-            f"在本地缓存找到 {len(candidates)} 个匹配的副本，无法唯一定位（同名同 size 多份，且消息 XML 没含 md5 用于强校验）:\n  "
+            f"消息 XML 没含 md5 字段，本工具拒绝基于 (filename+size) 启发式返回路径"
+            f"（避免 silent 命中无关消息的同名缓存）:\n  "
             + '\n  '.join(details)
-            + f"\n请人工 inspect mtime / 上下文区分"
+            + more
+            + f"\n如确实需要这个文件，请人工 inspect 候选并直接 Read 你认可的 path"
         )
 
-    chosen = candidates[0]
-    if not _path_under_root(chosen, cache_root):
-        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
+    # 用 expected_md5 过滤 candidates；同 md5 = 真同一文件副本。
+    md5_match = []
+    md5_errors = []
+    for c in candidates:
+        if not _path_under_root(c, cache_root):
+            md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
+            continue
+        actual_md5, err = _md5_file_chunked(c)
+        if err:
+            md5_errors.append(f"{c}: {err}")
+            continue
+        if actual_md5 == expected_md5:
+            md5_match.append(c)
+    if not md5_match:
+        info = (
+            f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
+            f"  期望 md5: {expected_md5}\n"
+            f"  说明：找到 {len(candidates)} 个同名同 size 的本地文件但 md5 都不对。"
+            f"目标文件可能未在 wechat 客户端打开过，或已被清理。"
+        )
+        if md5_errors:
+            info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
+        return info
 
-    binding_note = (
-        "✅ md5 校验通过，路径与消息唯一绑定"
-        if md5_verified else
-        f"⚠️  消息 XML 没含 md5，路径只能基于 (filename+size) 启发式匹配。"
-        f"如果同 chat 缓存里另有同名同 size 的不相关文件，本工具可能返回错副本。请人工验证。"
-    )
+    chosen = md5_match[0]
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  扩展名: {fileext or os.path.splitext(title)[1].lstrip('.') or '?'}\n"
         f"  期望大小: {totallen:,} bytes\n"
-        f"  {binding_note}"
+        f"  ✅ md5 校验通过，路径与消息唯一绑定"
     )
 
 
@@ -2367,36 +2391,53 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
             + f"\n请通过其他途径区分（人工 inspect mtime 或匹配上下文）"
         )
 
-    chosen = candidates[0]
-    # realpath 二次验证：拼接后仍在 wechat 缓存根下（防 symlink 跳出）
     cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
-    if not _path_under_root(chosen, cache_root):
-        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
+    # 没 fullmd5 = 没法 cryptographic 证明候选属于该 record → fail closed。
+    # Codex round-6 high #2: candidates==1 时 ⚠️ warning 不能阻止下游使用错路径。
+    if not (expected_md5 and len(expected_md5) == 32):
+        from datetime import datetime as _dt
+        details = []
+        for c in candidates[:5]:
+            try:
+                mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
+            except OSError:
+                mt = '?'
+            details.append(f"{c} (mtime={mt})")
+        more = "" if len(candidates) <= 5 else f"\n  …还有 {len(candidates) - 5} 个候选"
+        return (
+            f"该 dataitem XML 没含 fullmd5 字段，本工具拒绝基于"
+            f" (item_index+filename+size) 启发式返回路径\n"
+            f"（避免 silent 返回同 chat 内别条 record 的同名同 size 文件）:\n  "
+            + '\n  '.join(details)
+            + more
+            + f"\n如确实需要，请人工 inspect 候选并直接 Read 你认可的 path"
+        )
 
-    # md5 强校验：dataitem XML 含 fullmd5 时，必须本地文件 md5 完全匹配，
-    # 否则即使同名同 size 也是另一条 record 的同名文件 → fail closed
-    md5_verified = False
-    if expected_md5 and len(expected_md5) == 32:
-        import hashlib as _hashlib
-        try:
-            with open(chosen, 'rb') as _f:
-                actual_md5 = _hashlib.md5(_f.read()).hexdigest().lower()
-            if actual_md5 != expected_md5:
-                return (
-                    f"⚠️ 候选文件 md5 不匹配，拒绝返回错文件:\n"
-                    f"  路径: {chosen}\n"
-                    f"  期望 md5: {expected_md5}\n"
-                    f"  实际 md5: {actual_md5}\n"
-                    f"  说明：该路径上同位置同名同 size 的文件不属于 local_id={local_id} 的这条 record。"
-                    f"目标文件可能未在 wechat 客户端点开过，请去 wechat 点击下载第 {item_index + 1} 项。"
-                )
-            md5_verified = True
-        except OSError as e:
-            return f"读取候选文件 md5 失败: {e}"
+    # md5 过滤候选
+    md5_match = []
+    md5_errors = []
+    for c in candidates:
+        if not _path_under_root(c, cache_root):
+            md5_errors.append(f"{c}: 不在 {cache_root} 下，跳过")
+            continue
+        actual_md5, err = _md5_file_chunked(c)
+        if err:
+            md5_errors.append(f"{c}: {err}")
+            continue
+        if actual_md5 == expected_md5:
+            md5_match.append(c)
+    if not md5_match:
+        info = (
+            f"⚠️ 候选文件 md5 都不匹配，拒绝返回错文件:\n"
+            f"  期望 md5: {expected_md5}\n"
+            f"  说明：候选 {len(candidates)} 个，md5 都不对。"
+            f"目标 dataitem 可能未在 wechat 客户端点开过，请点击第 {item_index + 1} 项触发下载。"
+        )
+        if md5_errors:
+            info += "\n  校验异常：\n    " + "\n    ".join(md5_errors)
+        return info
 
-    binding_note = "✅ md5 校验通过，路径与 dataitem 唯一绑定" if md5_verified else \
-        f"⚠️  此 dataitem 的 XML 没含 fullmd5，路径只能基于 (item_index+filename+size) 启发式匹配。" \
-        f"如果同 chat 内多条合并卡片碰巧含同位置同名同 size 的文件，本工具可能返回别条 record 的副本。"
+    chosen = md5_match[0]
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
@@ -2404,7 +2445,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         f"  期望大小: {datasize:,} bytes\n"
         f"  发送者: {sourcename}\n"
         f"  类型: [{type_label}] {datatitle or '(无标题)'}\n"
-        f"  {binding_note}"
+        f"  ✅ md5 校验通过，路径与 dataitem 唯一绑定"
     )
 
 
