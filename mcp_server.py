@@ -555,25 +555,15 @@ def _resolve_quote_sender_label(ref_user, ref_display_name, is_group, chat_usern
     return ''
 
 
-def _parse_xml_root(content):
-    if not content or len(content) > _XML_PARSE_MAX_LEN or _XML_UNSAFE_RE.search(content):
-        return None
-
-    try:
-        return ET.fromstring(content)
-    except ET.ParseError:
-        return None
-
-
-# 合并转发的 recorditem 内嵌 XML 在 dataitem 数量多时显著超过 20K，
-# 实测含 99 条 dataitem 的卡片可达 ~418KB，用更宽的上限专门解析。
+# 合并转发消息（含 recorditem 内嵌 XML）在 dataitem 数量多时显著超过默认 20K 上限，
+# 实测真实 outer XML 可达 ~500KB。caller 可通过 max_len 参数为 type=19 类大消息放宽限制。
 _RECORD_XML_PARSE_MAX_LEN = 500_000
 
 
-def _parse_record_xml(content):
-    """专用于 recorditem 内嵌 XML 解析，允许更大 payload。"""
-    if not content or len(content) > _RECORD_XML_PARSE_MAX_LEN or _XML_UNSAFE_RE.search(content):
+def _parse_xml_root(content, max_len=_XML_PARSE_MAX_LEN):
+    if not content or len(content) > max_len or _XML_UNSAFE_RE.search(content):
         return None
+
     try:
         return ET.fromstring(content)
     except ET.ParseError:
@@ -593,6 +583,11 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
 
     _, sub_type = _split_msg_type(local_type)
     root = _parse_xml_root(content)
+    if root is None and len(content) <= _RECORD_XML_PARSE_MAX_LEN:
+        # type=19 合并转发卡片 outer XML 可超过默认 20K，必要时用更宽上限重试，
+        # 否则展开链 _format_record_message_text → _parse_xml_root(record_node.text)
+        # 永远到不了，大合并消息会静默退化为 [链接/文件]。
+        root = _parse_xml_root(content, max_len=_RECORD_XML_PARSE_MAX_LEN)
     if root is None:
         return None
 
@@ -703,7 +698,7 @@ def _format_record_message_text(appmsg, title):
     if record_node is None or not record_node.text:
         return f"[聊天记录] {fallback_title}（待加载）"
 
-    inner = _parse_record_xml(record_node.text)
+    inner = _parse_xml_root(record_node.text, max_len=_RECORD_XML_PARSE_MAX_LEN)
     if inner is None:
         return f"[聊天记录] {fallback_title}"
 
@@ -721,7 +716,7 @@ def _format_record_message_text(appmsg, title):
     header += f"，共 {len(items)} 条"
 
     lines = [header + ":"]
-    for item in items[:_RECORD_MAX_ITEMS]:
+    for idx, item in enumerate(items[:_RECORD_MAX_ITEMS]):
         sender = _collapse_text(item.findtext('sourcename') or '')
         when = _collapse_text(item.findtext('sourcetime') or '')
         content = _format_record_dataitem(item)
@@ -729,9 +724,10 @@ def _format_record_message_text(appmsg, title):
         if len(content) > _RECORD_MAX_LINE_LEN:
             content = content[:_RECORD_MAX_LINE_LEN] + '…'
 
-        prefix_parts = [p for p in (when, sender) if p]
+        # 0-based index 让用户能用 decode_record_item(chat, local_id, item_index) 引用
+        prefix_parts = [f"[{idx}]"] + [p for p in (when, sender) if p]
         prefix = ' '.join(prefix_parts)
-        lines.append(f"  {prefix}: {content}" if prefix else f"  {content}")
+        lines.append(f"  {prefix}: {content}")
 
     if len(items) > _RECORD_MAX_ITEMS:
         lines.append(f"  …（还有 {len(items) - _RECORD_MAX_ITEMS} 条未显示）")
@@ -768,20 +764,37 @@ def _format_voip_message_text(content):
     return f"[通话] {status_map.get(raw_text, raw_text)}"
 
 
-def _format_message_text(local_id, local_type, content, is_group, chat_username, chat_display_name, names):
+def _format_message_text(local_id, local_type, content, is_group, chat_username, chat_display_name, names, create_time=0):
     sender_from_content, text = _parse_message_content(content, local_type, is_group)
     base_type, _ = _split_msg_type(local_type)
 
+    # 同一 chat 的消息可能跨 message_N.db 分片，导致 local_id 跨分片冲突。
+    # 把 create_time 一起注入到输出，让 decode_file_message / decode_record_item
+    # 能用 (local_id, create_time) 唯一定位 row。
+    def _id_suffix():
+        return f"(local_id={local_id}, ts={create_time})" if create_time else f"(local_id={local_id})"
+
     if base_type == 3:
-        text = f"[图片] (local_id={local_id})"
+        text = f"[图片] {_id_suffix()}"
     elif base_type == 47:
         text = "[表情]"
     elif base_type == 50:
         text = _format_voip_message_text(text) or "[通话]"
     elif base_type == 49:
-        text = _format_app_message_text(
+        formatted = _format_app_message_text(
             text, local_type, is_group, chat_username, chat_display_name, names
         ) or "[链接/文件]"
+        if formatted.startswith('[文件]'):
+            formatted = f"{formatted} {_id_suffix()}"
+        elif formatted.startswith('[聊天记录]'):
+            # 多行：把 ID 后缀放在 header 末尾，":" 之前
+            if '\n' in formatted:
+                first_line, rest = formatted.split('\n', 1)
+                first_line_no_colon = first_line.rstrip(':').rstrip()
+                formatted = f"{first_line_no_colon} {_id_suffix()}:\n{rest}"
+            else:
+                formatted = f"{formatted} {_id_suffix()}"
+        text = formatted
     elif base_type != 1:
         type_label = format_msg_type(local_type)
         text = f"[{type_label}] {text}" if text else f"[{type_label}]"
@@ -1042,7 +1055,8 @@ def _build_search_entry(row, ctx, names, id_to_username):
         return None
 
     sender, text = _format_message_text(
-        local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names
+        local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names,
+        create_time=create_time,
     )
     if text and len(text) > 300:
         text = text[:300] + '...'
@@ -1072,7 +1086,8 @@ def _build_history_line(row, ctx, names, id_to_username):
         content = '(无法解压)'
 
     sender, text = _format_message_text(
-        local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names
+        local_id, local_type, content, ctx['is_group'], ctx['username'], ctx['display_name'], names,
+        create_time=create_time,
     )
 
     sender_label = _resolve_sender_label(
@@ -1817,58 +1832,83 @@ def decode_image(chat_name: str, local_id: int) -> str:
 
 
 @mcp.tool()
-def decode_file_message(chat_name: str, local_id: int) -> str:
+def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> str:
     """获取微信聊天中外层文件消息（PDF/docx/xlsx 等）的本地副本路径。
 
     微信会把对方发来的文件下载到 ~/Library/.../msg/file/{YYYY-MM}/原文件名.{ext}
     （macOS）。本工具从消息记录解析出文件名/大小，在本地缓存中精确定位，
     然后返回原始路径，可直接交给 Read/PDF 工具读取。
 
-    使用流程：先用 get_chat_history 找到 [文件] xxx.pdf 类消息的 local_id，
-    再用本工具拿到本地路径。
+    使用流程：先用 get_chat_history 找到 [文件] xxx.pdf (local_id=N, ts=T)，
+    把 N 和 T 一起传给本工具。create_time(ts) 用于跨分片场景下唯一定位。
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
         local_id: 文件消息的 local_id（从 get_chat_history 获取）
+        create_time: 消息的 unix 时间戳，从 get_chat_history 输出 ts=N 部分获取。
+            用于在 local_id 跨分片冲突时唯一定位；传 0 时若多个分片含同 local_id 会报歧义错误
     """
     try:
         local_id = int(local_id)
+        create_time = int(create_time)
     except (TypeError, ValueError):
-        return "错误: local_id 必须是整数"
+        return "错误: local_id 和 create_time 必须是整数"
 
     username = resolve_username(chat_name)
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
-    # 同一 chat 的消息可能分散在多个 message_N.db 分片中，遍历所有分片查 local_id
+    # 同一 chat 的消息可能分散在多个 message_N.db 分片中。扫所有分片收集 row，
+    # 多于一条就报歧义错误（避免 silent decoding wrong message）。
     shards = _find_msg_tables_for_user(username)
     if not shards:
         return f"找不到 {chat_name} 的消息表"
 
-    row = None
-    table_name = None
+    # 扫所有分片收集 row。如果调用者传了 create_time，用 (local_id, create_time)
+    # 精确匹配；否则只按 local_id 收集，多匹配时报歧义并提示加 create_time。
+    matches = []
     for shard in shards:
         if not _is_safe_msg_table_name(shard['table_name']):
             continue
         with closing(sqlite3.connect(shard['db_path'])) as conn:
-            candidate_row = conn.execute(
-                f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
-                f"FROM [{shard['table_name']}] WHERE local_id=?",
-                (local_id,)
-            ).fetchone()
+            if create_time:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=? AND create_time=?",
+                    (local_id, create_time)
+                ).fetchone()
+            else:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=?",
+                    (local_id,)
+                ).fetchone()
         if candidate_row:
-            row = candidate_row
-            table_name = shard['table_name']
-            break
-    if not row:
+            matches.append((shard['db_path'], candidate_row))
+    if not matches:
+        if create_time:
+            return f"找不到 (local_id={local_id}, create_time={create_time}) 的消息（已扫描 {len(shards)} 个分片）"
         return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
+    if len(matches) > 1:
+        from datetime import datetime as _dt
+        details = []
+        for db_p, r in matches:
+            ct = r[1]
+            ts_str = _dt.fromtimestamp(ct).isoformat() if ct else '?'
+            details.append(f"{os.path.basename(db_p)} create_time={ct} ({ts_str})")
+        return (
+            f"local_id={local_id} 在 {len(matches)} 个分片中都存在，无法唯一定位:\n  "
+            + '\n  '.join(details)
+            + f"\n请加 create_time 参数：decode_file_message(chat_name, local_id={local_id}, create_time=N)"
+        )
 
+    _, row = matches[0]
     local_type, create_time, content, ct_compress = row
     base_type, _ = _split_msg_type(local_type)
     if base_type != 49:
         return (
             f"不是文件消息（local_type={local_type}，base_type={base_type}），"
-            f"文件消息应为 base_type=49 且 sub_type=6"
+            f"文件消息应为 base_type=49 且 appmsg type=6"
         )
 
     xml_text = _decompress_content(content, ct_compress)
@@ -1887,9 +1927,23 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
     if appmsg is None:
         return "消息中没有 appmsg 段（可能不是文件类型）"
 
+    # 必须是 appmsg type=6 (文件)，否则可能是链接/小程序/合并转发等带 title 的卡片，
+    # 按 title/size 全盘搜会误命中无关本地文件并伪装成"找到了"。
+    app_type_in_msg = _parse_int(_collapse_text(appmsg.findtext('type') or ''), 0)
+    if app_type_in_msg != 6:
+        return (
+            f"不是文件消息（appmsg type={app_type_in_msg}）。"
+            f"文件消息要求 appmsg type=6；type=19 请用 decode_record_item，"
+            f"type=5/33/36/44 等是链接/小程序，没有可下载的本地文件"
+        )
+
     title = _collapse_text(appmsg.findtext('title') or '')
     fileext = _collapse_text(appmsg.findtext('.//fileext') or '')
     totallen = _parse_int(_collapse_text(appmsg.findtext('.//totallen') or ''), 0)
+
+    # 没有 appattach 节点 = 不是真正的文件消息（type=6 必带 appattach）
+    if appmsg.find('appattach') is None:
+        return "消息没有 appattach 节点（可能 schema 异常或不是真文件消息）"
 
     if not title:
         return "消息中没有文件名 (title)"
@@ -1981,13 +2035,13 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
 
 
 @mcp.tool()
-def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
+def decode_record_item(chat_name: str, local_id: int, item_index: int, create_time: int = 0) -> str:
     """获取合并转发聊天记录中某个内嵌文件/图片的本地副本路径。
 
     使用流程：
-    1. 先用 get_chat_history 找到 [聊天记录] xxx 卡片，记下其 local_id 以及要的
-       dataitem 在 datalist 里的位置（0-based，第一条 = 0）
-    2. 用本工具拿本地路径
+    1. 先用 get_chat_history 找到 [聊天记录] xxx (local_id=N, ts=T) 卡片，记下 N 和 T，
+       以及展开行里 [item_index] 前缀（0-based）
+    2. 用本工具拿本地路径，create_time 传 history 里的 ts 部分
     3. 如果未下载，工具会精确告诉你去 wechat 客户端点击合并卡片里的第几项触发下载
 
     注意：合并转发里的内嵌文件只有在用户**点击查看**后 wechat 才会下载到本地。
@@ -1996,42 +2050,62 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
         local_id: 合并转发消息（带"[聊天记录]"标记）的 local_id
-        item_index: dataitem 在 datalist 里的 0-based 索引
+        item_index: dataitem 在 datalist 里的 0-based 索引（history 输出里的 [N] 前缀）
+        create_time: 消息的 unix 时间戳；用于跨分片唯一定位，传 0 时多匹配会报歧义
     """
     try:
         local_id = int(local_id)
         item_index = int(item_index)
+        create_time = int(create_time)
     except (TypeError, ValueError):
-        return "错误: local_id 和 item_index 必须是整数"
+        return "错误: local_id / item_index / create_time 必须是整数"
 
     username = resolve_username(chat_name)
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
-    # 同一 chat 的消息可能分散在多个 message_N.db 分片中，遍历所有分片查 local_id
+    # 多分片扫描 + ambiguity 检测（避免 silent decoding wrong message，参考 decode_file_message）
     shards = _find_msg_tables_for_user(username)
     if not shards:
         return f"找不到 {chat_name} 的消息表"
 
-    row = None
-    table_name = None
+    matches = []
     for shard in shards:
         if not _is_safe_msg_table_name(shard['table_name']):
             continue
         with closing(sqlite3.connect(shard['db_path'])) as conn:
-            candidate_row = conn.execute(
-                f"SELECT local_type, message_content, WCDB_CT_message_content "
-                f"FROM [{shard['table_name']}] WHERE local_id=?",
-                (local_id,)
-            ).fetchone()
+            if create_time:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=? AND create_time=?",
+                    (local_id, create_time)
+                ).fetchone()
+            else:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=?",
+                    (local_id,)
+                ).fetchone()
         if candidate_row:
-            row = candidate_row
-            table_name = shard['table_name']
-            break
-    if not row:
+            matches.append((shard['table_name'], candidate_row))
+    if not matches:
+        if create_time:
+            return f"找不到 (local_id={local_id}, create_time={create_time}) 的消息（已扫描 {len(shards)} 个分片）"
         return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
+    if len(matches) > 1:
+        from datetime import datetime as _dt
+        details = []
+        for tn, r in matches:
+            ts_str = _dt.fromtimestamp(r[1]).isoformat() if r[1] else '?'
+            details.append(f"table={tn[:12]}... create_time={r[1]} ({ts_str})")
+        return (
+            f"local_id={local_id} 在 {len(matches)} 个分片中都存在，无法唯一定位:\n  "
+            + '\n  '.join(details)
+            + f"\n请加 create_time 参数：decode_record_item(chat_name, local_id={local_id}, item_index={item_index}, create_time=N)"
+        )
 
-    local_type, content, ct_compress = row
+    table_name, row = matches[0]
+    local_type, _create_time, content, ct_compress = row
     base_type, _ = _split_msg_type(local_type)
     if base_type != 49:
         return (
@@ -2065,7 +2139,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     if record_node is None or not record_node.text:
         return "消息中没有 recorditem（datalist 还未加载，请在 wechat 中点开此卡片让客户端拉取）"
 
-    inner = _parse_record_xml(record_node.text)
+    inner = _parse_xml_root(record_node.text, max_len=_RECORD_XML_PARSE_MAX_LEN)
     if inner is None:
         return "无法解析 recorditem 内嵌 XML"
 
