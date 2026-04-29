@@ -2081,29 +2081,32 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
                     if hit not in candidates:
                         candidates.append(hit)
 
-    # 退路：未命中或没 create_time 时只 walk msg/file（slow path 兜底）
-    # 不再扫 msg/attach —— 那是合并卡片/图片的缓存目录，外层文件不应该出现在那。
-    # Codex round-5 high #1：之前扫 msg/attach 会让另一条合并 record 里的同名同 size
-    # 文件被当作目标，silent 返回错副本。
+    # 退路：未命中或没 create_time 时只 walk msg/file（slow path 兜底）。
+    # 文件名匹配严格化：只接受精确匹配或 wechat 自动加副本的 "(N)" 后缀变体
+    # （round-8 high #1：之前用 `stem in f` 子串匹配会把"某某论文.pdf"当成 "论文.pdf"）。
     if not candidates:
         d = os.path.join(WECHAT_BASE_DIR, 'msg/file')
+        stem, ext = os.path.splitext(title)
+        copy_pattern = re.compile(
+            r'^' + re.escape(stem) + r' ?\(\d+\)' + re.escape(ext) + r'$'
+        )
         if os.path.isdir(d):
             for root_dir, _, files in os.walk(d):
                 for f in files:
                     if f.startswith('.'):
                         continue
                     full = os.path.join(root_dir, f)
-                    if f == title:
-                        candidates.append(full)
+                    is_exact = (f == title)
+                    is_copy_variant = bool(copy_pattern.match(f))
+                    if not (is_exact or is_copy_variant):
                         continue
                     if totallen:
                         try:
-                            if os.path.getsize(full) == totallen:
-                                stem = os.path.splitext(title)[0]
-                                if stem and stem in f:
-                                    candidates.append(full)
+                            if os.path.getsize(full) != totallen:
+                                continue
                         except OSError:
-                            pass
+                            continue
+                    candidates.append(full)
 
     if not candidates:
         return (
@@ -2413,25 +2416,8 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
             f"  解决方法: 在 wechat 客户端打开此合并记录卡片，点击第 {item_index + 1} 项让客户端下载，再试"
         )
 
-    # Fail closed：多 candidates 时报歧义而不是 silent 选 mtime 最新。
-    # 不同合并卡片可能在 wechat 缓存里产生同 (filename, size, item_index) 的副本，
-    # 用 mtime 选最新会让用户拿到非自己 local_id 对应的 record 的文件。
-    if len(candidates) > 1:
-        from datetime import datetime as _dt
-        details = []
-        for c in candidates:
-            try:
-                mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
-            except OSError:
-                mt = '?'
-            details.append(f"{c} (mtime={mt})")
-        return (
-            f"找到 {len(candidates)} 个匹配的本地副本，无法唯一定位（可能其他合并卡片"
-            f"也含同名同 size 的同位置 dataitem）:\n  "
-            + '\n  '.join(details)
-            + f"\n请通过其他途径区分（人工 inspect mtime 或匹配上下文）"
-        )
-
+    # 注意：早 ambiguity check（在 md5 filter 之前）已经被删除——它会让有 fullmd5
+    # 但多 candidates 的合理 case silent 失败。md5 filter 后再做歧义判断（见下方）。
     # 威胁模型：本工具是用户主动通过 MCP 调用 + path 只在本地显示。
     # 跟 decode_file_message 一致路线：有 md5 强校验，没 md5 fallback 到
     # heuristic + warning（实用 over 严格）。
