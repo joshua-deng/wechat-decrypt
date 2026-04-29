@@ -1840,20 +1840,28 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
-    db_path, table_name = _find_msg_table_for_user(username)
-    if not db_path or not table_name:
+    # 同一 chat 的消息可能分散在多个 message_N.db 分片中，遍历所有分片查 local_id
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
         return f"找不到 {chat_name} 的消息表"
-    if not _is_safe_msg_table_name(table_name):
-        return f"非法消息表名: {table_name}"
 
-    with closing(sqlite3.connect(db_path)) as conn:
-        row = conn.execute(
-            f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
-            f"FROM [{table_name}] WHERE local_id=?",
-            (local_id,)
-        ).fetchone()
+    row = None
+    table_name = None
+    for shard in shards:
+        if not _is_safe_msg_table_name(shard['table_name']):
+            continue
+        with closing(sqlite3.connect(shard['db_path'])) as conn:
+            candidate_row = conn.execute(
+                f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                f"FROM [{shard['table_name']}] WHERE local_id=?",
+                (local_id,)
+            ).fetchone()
+        if candidate_row:
+            row = candidate_row
+            table_name = shard['table_name']
+            break
     if not row:
-        return f"找不到 local_id={local_id} 的消息"
+        return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
 
     local_type, create_time, content, ct_compress = row
     base_type, _ = _split_msg_type(local_type)
@@ -1912,6 +1920,14 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
                 f"{escaped_stem}*{glob_mod.escape(ext)}" if ext else f"{escaped_stem}*",
             ):
                 for hit in glob_mod.glob(os.path.join(month_dir, pattern)):
+                    # 有 totallen 时立刻 size 验证：避免月扫命中"同名但 size 不对"的副本
+                    # 阻塞 walk 兜底，最终返回错误文件
+                    if totallen:
+                        try:
+                            if os.path.getsize(hit) != totallen:
+                                continue
+                        except OSError:
+                            continue
                     if hit not in candidates:
                         candidates.append(hit)
 
@@ -1992,20 +2008,28 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
-    db_path, table_name = _find_msg_table_for_user(username)
-    if not db_path or not table_name:
+    # 同一 chat 的消息可能分散在多个 message_N.db 分片中，遍历所有分片查 local_id
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
         return f"找不到 {chat_name} 的消息表"
-    if not _is_safe_msg_table_name(table_name):
-        return f"非法消息表名: {table_name}"
 
-    with closing(sqlite3.connect(db_path)) as conn:
-        row = conn.execute(
-            f"SELECT local_type, message_content, WCDB_CT_message_content "
-            f"FROM [{table_name}] WHERE local_id=?",
-            (local_id,)
-        ).fetchone()
+    row = None
+    table_name = None
+    for shard in shards:
+        if not _is_safe_msg_table_name(shard['table_name']):
+            continue
+        with closing(sqlite3.connect(shard['db_path'])) as conn:
+            candidate_row = conn.execute(
+                f"SELECT local_type, message_content, WCDB_CT_message_content "
+                f"FROM [{shard['table_name']}] WHERE local_id=?",
+                (local_id,)
+            ).fetchone()
+        if candidate_row:
+            row = candidate_row
+            table_name = shard['table_name']
+            break
     if not row:
-        return f"找不到 local_id={local_id} 的消息"
+        return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
 
     local_type, content, ct_compress = row
     base_type, _ = _split_msg_type(local_type)
@@ -2091,6 +2115,14 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
         if datatitle:
             escaped_title = glob_mod.escape(datatitle)
             for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, escaped_title)):
+                # 有 datasize 时立刻 size 验证：避免命中"同名但 size 不对"的副本
+                # 阻塞兜底匹配，最终返回错误文件
+                if datasize:
+                    try:
+                        if os.path.getsize(hit) != datasize:
+                            continue
+                    except OSError:
+                        continue
                 if hit not in candidates:
                     candidates.append(hit)
 
