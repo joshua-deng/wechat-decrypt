@@ -2032,11 +2032,13 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     table_hash = table_name.replace('Msg_', '', 1)
     attach_dir = os.path.join(WECHAT_BASE_DIR, 'msg/attach', table_hash)
 
+    # 文件类（datatype=8）落 F/{idx}/，图片类落 Img/{idx}/，视频类落 V/{idx}/
+    # 提到 if-block 之外，否则下方 not-found 分支引用时会 UnboundLocalError
+    subdir_map = {'8': 'F', '2': 'Img', '5': 'V', '4': 'A'}
+
     candidates = []
     if os.path.isdir(attach_dir):
         import glob as glob_mod
-        # 文件类（datatype=8）落 F/{idx}/，图片类落 Img/{idx}/，视频类落 V/{idx}/
-        subdir_map = {'8': 'F', '2': 'Img', '5': 'V', '4': 'A'}
         sub = subdir_map.get(datatype, '*')
         idx_str = str(item_index)
 
