@@ -565,6 +565,21 @@ def _parse_xml_root(content):
         return None
 
 
+# 合并转发的 recorditem 内嵌 XML 在 dataitem 数量多时显著超过 20K，
+# 实测含 99 条 dataitem 的卡片可达 ~50KB，用更宽的上限专门解析。
+_RECORD_XML_PARSE_MAX_LEN = 500_000
+
+
+def _parse_record_xml(content):
+    """专用于 recorditem 内嵌 XML 解析，允许更大 payload。"""
+    if not content or len(content) > _RECORD_XML_PARSE_MAX_LEN or _XML_UNSAFE_RE.search(content):
+        return None
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError:
+        return None
+
+
 def _parse_int(value, fallback=0):
     try:
         return int(value)
@@ -688,7 +703,7 @@ def _format_record_message_text(appmsg, title):
     if record_node is None or not record_node.text:
         return f"[聊天记录] {fallback_title}（待加载）"
 
-    inner = _parse_xml_root(record_node.text)
+    inner = _parse_record_xml(record_node.text)
     if inner is None:
         return f"[聊天记录] {fallback_title}"
 
@@ -1996,7 +2011,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     if record_node is None or not record_node.text:
         return "消息中没有 recorditem（datalist 还未加载，请在 wechat 中点开此卡片让客户端拉取）"
 
-    inner = _parse_xml_root(record_node.text)
+    inner = _parse_record_xml(record_node.text)
     if inner is None:
         return "无法解析 recorditem 内嵌 XML"
 
@@ -2042,9 +2057,10 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
         sub = subdir_map.get(datatype, '*')
         idx_str = str(item_index)
 
-        # 精确文件名匹配
+        # 精确文件名匹配（datatitle 可能含 [ ] * ? 等 glob 元字符，必须 escape）
         if datatitle:
-            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, datatitle)):
+            escaped_title = glob_mod.escape(datatitle)
+            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, escaped_title)):
                 if hit not in candidates:
                     candidates.append(hit)
 
