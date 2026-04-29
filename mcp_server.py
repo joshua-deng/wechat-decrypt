@@ -610,6 +610,9 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
             quote_text += f"\n  ↳ {prefix}{ref_content}"
         return quote_text
 
+    if app_type == 19:
+        return _format_record_message_text(appmsg, title)
+
     if app_type == 6:
         return f"[文件] {title}" if title else "[文件]"
     if app_type == 5:
@@ -619,6 +622,106 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
     if title:
         return f"[链接/文件] {title}"
     return "[链接/文件]"
+
+
+_RECORD_MAX_ITEMS = 50
+_RECORD_MAX_LINE_LEN = 200
+
+
+def _format_record_dataitem(item):
+    """格式化合并记录中的单个 dataitem，返回展示文本。"""
+    datatype = (item.get('datatype') or '').strip()
+
+    if datatype == '1':
+        return _collapse_text(item.findtext('datadesc') or '') or '[文本]'
+    if datatype == '2':
+        return '[图片]'
+    if datatype == '3':
+        return '[名片]'
+    if datatype == '4':
+        return '[语音]'
+    if datatype == '5':
+        return '[视频]'
+    if datatype == '6':
+        link_title = _collapse_text(item.findtext('datatitle') or '')
+        return f"[链接] {link_title}" if link_title else '[链接]'
+    if datatype == '7':
+        return '[位置]'
+    if datatype == '8':
+        file_title = _collapse_text(item.findtext('datatitle') or '')
+        return f"[文件] {file_title}" if file_title else '[文件]'
+    if datatype == '17':
+        nested_title = _collapse_text(item.findtext('datatitle') or '')
+        return f"[聊天记录] {nested_title}" if nested_title else '[聊天记录]'
+    if datatype == '19':
+        app_name = _collapse_text(item.findtext('.//appbranditem/sourcedisplayname') or '')
+        item_title = _collapse_text(item.findtext('datatitle') or '')
+        label = item_title or app_name or '小程序'
+        return f"[小程序] {label}"
+    if datatype == '22':
+        feed_desc = _collapse_text(item.findtext('.//finderFeed/desc') or '')
+        return f"[视频号] {feed_desc[:80]}" if feed_desc else '[视频号]'
+    if datatype == '23':
+        return '[视频号直播]'
+    if datatype == '29':
+        song = _collapse_text(item.findtext('datatitle') or '')
+        artist = _collapse_text(item.findtext('datadesc') or '')
+        if song and artist:
+            return f"[音乐] {song} - {artist}"
+        return f"[音乐] {song}" if song else '[音乐]'
+    if datatype == '36':
+        link_title = _collapse_text(item.findtext('datatitle') or '')
+        return f"[小程序/H5] {link_title}" if link_title else '[小程序/H5]'
+    if datatype == '37':
+        return '[表情包]'
+
+    desc = _collapse_text(item.findtext('datadesc') or '')
+    title_text = _collapse_text(item.findtext('datatitle') or '')
+    fallback = desc or title_text
+    return fallback if fallback else f"[未知类型 {datatype}]"
+
+
+def _format_record_message_text(appmsg, title):
+    """解析合并转发的聊天记录卡片（appmsg type=19, recorditem）。"""
+    fallback_title = title or '聊天记录'
+    record_node = appmsg.find('recorditem')
+    if record_node is None or not record_node.text:
+        return f"[聊天记录] {fallback_title}（待加载）"
+
+    inner = _parse_xml_root(record_node.text)
+    if inner is None:
+        return f"[聊天记录] {fallback_title}"
+
+    record_title = _collapse_text(inner.findtext('title') or '') or fallback_title
+    is_chatroom = (inner.findtext('isChatRoom') or '').strip() == '1'
+    datalist = inner.find('datalist')
+    items = list(datalist.findall('dataitem')) if datalist is not None else []
+    if not items:
+        suffix = "（群聊转发，待加载）" if is_chatroom else "（待加载）"
+        return f"[聊天记录] {record_title}{suffix}"
+
+    header = f"[聊天记录] {record_title}"
+    if is_chatroom:
+        header += "（群聊转发）"
+    header += f"，共 {len(items)} 条"
+
+    lines = [header + ":"]
+    for item in items[:_RECORD_MAX_ITEMS]:
+        sender = _collapse_text(item.findtext('sourcename') or '')
+        when = _collapse_text(item.findtext('sourcetime') or '')
+        content = _format_record_dataitem(item)
+
+        if len(content) > _RECORD_MAX_LINE_LEN:
+            content = content[:_RECORD_MAX_LINE_LEN] + '…'
+
+        prefix_parts = [p for p in (when, sender) if p]
+        prefix = ' '.join(prefix_parts)
+        lines.append(f"  {prefix}: {content}" if prefix else f"  {content}")
+
+    if len(items) > _RECORD_MAX_ITEMS:
+        lines.append(f"  …（还有 {len(items) - _RECORD_MAX_ITEMS} 条未显示）")
+
+    return "\n".join(lines)
 
 
 def _format_voip_message_text(content):
@@ -1696,6 +1799,297 @@ def decode_image(chat_name: str, local_id: int) -> str:
         if 'md5' in result:
             error += f"\n  MD5: {result['md5']}"
         return f"解密失败: {error}"
+
+
+@mcp.tool()
+def decode_file_message(chat_name: str, local_id: int) -> str:
+    """获取微信聊天中外层文件消息（PDF/docx/xlsx 等）的本地副本路径。
+
+    微信会把对方发来的文件下载到 ~/Library/.../msg/file/{YYYY-MM}/原文件名.{ext}
+    （macOS）。本工具从消息记录解析出文件名/大小，在本地缓存中精确定位，
+    然后返回原始路径，可直接交给 Read/PDF 工具读取。
+
+    使用流程：先用 get_chat_history 找到 [文件] xxx.pdf 类消息的 local_id，
+    再用本工具拿到本地路径。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 文件消息的 local_id（从 get_chat_history 获取）
+    """
+    try:
+        local_id = int(local_id)
+    except (TypeError, ValueError):
+        return "错误: local_id 必须是整数"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    db_path, table_name = _find_msg_table_for_user(username)
+    if not db_path or not table_name:
+        return f"找不到 {chat_name} 的消息表"
+    if not _is_safe_msg_table_name(table_name):
+        return f"非法消息表名: {table_name}"
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            f"SELECT local_type, message_content, WCDB_CT_message_content "
+            f"FROM [{table_name}] WHERE local_id=?",
+            (local_id,)
+        ).fetchone()
+    if not row:
+        return f"找不到 local_id={local_id} 的消息"
+
+    local_type, content, ct_compress = row
+    base_type, _ = _split_msg_type(local_type)
+    if base_type != 49:
+        return (
+            f"不是文件消息（local_type={local_type}，base_type={base_type}），"
+            f"文件消息应为 base_type=49 且 sub_type=6"
+        )
+
+    xml_text = _decompress_content(content, ct_compress)
+    if not xml_text:
+        return "消息 content 为空或无法解码"
+
+    # 剥离群聊 sender 前缀 "wxid_xxx:\n<xml...>"
+    if '<appmsg' in xml_text and ':\n' in xml_text and not xml_text.lstrip().startswith('<'):
+        xml_text = xml_text.split(':\n', 1)[1]
+
+    root = _parse_xml_root(xml_text)
+    if root is None:
+        return "无法解析消息 XML"
+
+    appmsg = root.find('.//appmsg')
+    if appmsg is None:
+        return "消息中没有 appmsg 段（可能不是文件类型）"
+
+    title = _collapse_text(appmsg.findtext('title') or '')
+    fileext = _collapse_text(appmsg.findtext('.//fileext') or '')
+    totallen = _parse_int(_collapse_text(appmsg.findtext('.//totallen') or ''), 0)
+
+    if not title:
+        return "消息中没有文件名 (title)"
+
+    candidates = []
+    for sub_dir in ('msg/file', 'msg/attach'):
+        d = os.path.join(WECHAT_BASE_DIR, sub_dir)
+        if not os.path.isdir(d):
+            continue
+        for root_dir, _, files in os.walk(d):
+            for f in files:
+                if f.startswith('.'):
+                    continue
+                full = os.path.join(root_dir, f)
+                if f == title:
+                    candidates.append(full)
+                    continue
+                # 处理同名重复加 (1)(2) 后缀，按 size 二次确认
+                if totallen:
+                    try:
+                        if os.path.getsize(full) == totallen:
+                            stem = os.path.splitext(title)[0]
+                            if stem and stem in f:
+                                candidates.append(full)
+                    except OSError:
+                        pass
+
+    if not candidates:
+        return (
+            f"在本地缓存中找不到 {title}\n"
+            f"  期望路径模式: {WECHAT_BASE_DIR}/msg/file/YYYY-MM/{title}\n"
+            f"  可能原因：从未在 PC/Mac 微信打开过 / 已被清理"
+        )
+
+    # 优先取 size 完全匹配的；并按 mtime 最近排序
+    size_match = [c for c in candidates if totallen and os.path.getsize(c) == totallen]
+    if size_match:
+        candidates = size_match
+    candidates.sort(key=lambda p: -os.path.getmtime(p))
+    chosen = candidates[0]
+
+    extra = ""
+    if len(candidates) > 1:
+        extra = f"\n  其他候选: {len(candidates) - 1} 个"
+    return (
+        f"找到本地文件:\n"
+        f"  路径: {chosen}\n"
+        f"  大小: {os.path.getsize(chosen):,} bytes\n"
+        f"  扩展名: {fileext or os.path.splitext(title)[1].lstrip('.') or '?'}\n"
+        f"  期望大小: {totallen:,} bytes" + extra
+    )
+
+
+@mcp.tool()
+def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
+    """获取合并转发聊天记录中某个内嵌文件/图片的本地副本路径。
+
+    使用流程：
+    1. 先用 get_chat_history 找到 [聊天记录] xxx 卡片，记下其 local_id 以及要的
+       dataitem 在 datalist 里的位置（0-based，第一条 = 0）
+    2. 用本工具拿本地路径
+    3. 如果未下载，工具会精确告诉你去 wechat 客户端点击合并卡片里的第几项触发下载
+
+    注意：合并转发里的内嵌文件只有在用户**点击查看**后 wechat 才会下载到本地。
+    没点过的 dataitem 用本工具会得到"未下载"提示。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 合并转发消息（带"[聊天记录]"标记）的 local_id
+        item_index: dataitem 在 datalist 里的 0-based 索引
+    """
+    try:
+        local_id = int(local_id)
+        item_index = int(item_index)
+    except (TypeError, ValueError):
+        return "错误: local_id 和 item_index 必须是整数"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    db_path, table_name = _find_msg_table_for_user(username)
+    if not db_path or not table_name:
+        return f"找不到 {chat_name} 的消息表"
+    if not _is_safe_msg_table_name(table_name):
+        return f"非法消息表名: {table_name}"
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            f"SELECT local_type, message_content, WCDB_CT_message_content "
+            f"FROM [{table_name}] WHERE local_id=?",
+            (local_id,)
+        ).fetchone()
+    if not row:
+        return f"找不到 local_id={local_id} 的消息"
+
+    local_type, content, ct_compress = row
+    base_type, sub_type_packed = _split_msg_type(local_type)
+    if base_type != 49:
+        return (
+            f"不是合并转发消息（local_type={local_type}, base_type={base_type}），"
+            f"合并转发应为 base_type=49 + appmsg type=19"
+        )
+
+    xml_text = _decompress_content(content, ct_compress)
+    if not xml_text:
+        return "消息 content 为空或无法解码"
+
+    if '<appmsg' in xml_text and ':\n' in xml_text and not xml_text.lstrip().startswith('<'):
+        xml_text = xml_text.split(':\n', 1)[1]
+
+    root = _parse_xml_root(xml_text)
+    if root is None:
+        return "无法解析消息 XML（可能不是合并转发消息）"
+    appmsg = root.find('.//appmsg')
+    if appmsg is None:
+        return "消息中没有 appmsg 段"
+
+    app_type = _parse_int(_collapse_text(appmsg.findtext('type') or ''), 0)
+    if app_type != 19:
+        return (
+            f"不是合并转发消息（appmsg type={app_type}），"
+            f"合并转发应为 type=19。请用 decode_file_message 处理外层独立文件"
+        )
+
+    record_node = appmsg.find('recorditem')
+    if record_node is None or not record_node.text:
+        return "消息中没有 recorditem（datalist 还未加载，请在 wechat 中点开此卡片让客户端拉取）"
+
+    inner = _parse_xml_root(record_node.text)
+    if inner is None:
+        return "无法解析 recorditem 内嵌 XML"
+
+    datalist = inner.find('datalist')
+    items = list(datalist.findall('dataitem')) if datalist is not None else []
+    if not items:
+        return "datalist 为空（合并记录还未加载内容）"
+    if item_index < 0 or item_index >= len(items):
+        return f"item_index={item_index} 超出范围（共 {len(items)} 条 dataitem，0-based）"
+
+    item = items[item_index]
+    datatype = (item.get('datatype') or '').strip()
+    datatitle = _collapse_text(item.findtext('datatitle') or '')
+    datasize = _parse_int(_collapse_text(item.findtext('datasize') or ''), 0)
+    datafmt = _collapse_text(item.findtext('datafmt') or '')
+    sourcename = _collapse_text(item.findtext('sourcename') or '')
+
+    type_label = {
+        '1': '文本', '2': '图片', '3': '名片', '4': '语音',
+        '5': '视频', '6': '链接', '7': '位置', '8': '文件',
+        '17': '聊天记录', '19': '小程序', '22': '视频号',
+        '29': '音乐', '37': '表情包',
+    }.get(datatype, f'datatype={datatype}')
+
+    if datatype == '1':
+        text_content = _collapse_text(item.findtext('datadesc') or '')
+        return (
+            f"该 dataitem 是文本，无需下载:\n"
+            f"  发送者: {sourcename}\n"
+            f"  内容: {text_content}"
+        )
+
+    table_hash = table_name.replace('Msg_', '', 1)
+    attach_dir = os.path.join(WECHAT_BASE_DIR, 'msg/attach', table_hash)
+
+    candidates = []
+    if os.path.isdir(attach_dir):
+        import glob as glob_mod
+        # 文件类（datatype=8）落 F/{idx}/，图片类落 Img/{idx}/，视频类落 V/{idx}/
+        subdir_map = {'8': 'F', '2': 'Img', '5': 'V', '4': 'A'}
+        sub = subdir_map.get(datatype, '*')
+        idx_str = str(item_index)
+
+        # 精确文件名匹配
+        if datatitle:
+            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, datatitle)):
+                if hit not in candidates:
+                    candidates.append(hit)
+
+        # size 兜底匹配（任何文件名）
+        if not candidates and datasize:
+            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, '*')):
+                try:
+                    if os.path.getsize(hit) == datasize:
+                        candidates.append(hit)
+                except OSError:
+                    pass
+
+        # 终极兜底：不限定 sub 目录
+        if not candidates and datasize:
+            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*/*', idx_str, '*')):
+                try:
+                    if os.path.getsize(hit) == datasize:
+                        candidates.append(hit)
+                except OSError:
+                    pass
+
+    if not candidates:
+        return (
+            f"在本地缓存中找不到此 dataitem（很可能未在 wechat 客户端点击查看过）\n"
+            f"  消息: {chat_name} 的 local_id={local_id}\n"
+            f"  dataitem[{item_index}]: {sourcename}: [{type_label}] {datatitle or '(无标题)'}\n"
+            f"  期望大小: {datasize:,} bytes\n"
+            f"  期望路径模式: {attach_dir}/YYYY-MM/Rec/*/{subdir_map.get(datatype, '?')}/{item_index}/{datatitle}\n"
+            f"  解决方法: 在 wechat 客户端打开此合并记录卡片，点击第 {item_index + 1} 项让客户端下载，再试"
+        )
+
+    if datasize:
+        size_match = [c for c in candidates if os.path.getsize(c) == datasize]
+        if size_match:
+            candidates = size_match
+    candidates.sort(key=lambda p: -os.path.getmtime(p))
+    chosen = candidates[0]
+
+    extra = f"\n  其他候选: {len(candidates) - 1} 个" if len(candidates) > 1 else ""
+    return (
+        f"找到本地文件:\n"
+        f"  路径: {chosen}\n"
+        f"  大小: {os.path.getsize(chosen):,} bytes\n"
+        f"  期望大小: {datasize:,} bytes\n"
+        f"  发送者: {sourcename}\n"
+        f"  类型: [{type_label}] {datatitle or '(无标题)'}" + extra
+    )
 
 
 @mcp.tool()
