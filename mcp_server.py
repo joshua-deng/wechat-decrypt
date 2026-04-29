@@ -577,17 +577,23 @@ def _parse_int(value, fallback=0):
         return fallback
 
 
+def _parse_app_message_outer(content):
+    """Parse outer appmsg XML，自动在 default 20K 上限拒绝时用 _RECORD_XML_PARSE_MAX_LEN
+    重试。这是因为 type=19 合并转发卡片的 outer XML 可超 20K，所有解析 outer appmsg
+    的 caller（get_chat_history 渲染 / decode_file_message / decode_record_item）都
+    必须共用此宽容路径，否则同一条大消息在不同 caller 上行为不一致。"""
+    root = _parse_xml_root(content)
+    if root is None and content and len(content) <= _RECORD_XML_PARSE_MAX_LEN:
+        root = _parse_xml_root(content, max_len=_RECORD_XML_PARSE_MAX_LEN)
+    return root
+
+
 def _format_app_message_text(content, local_type, is_group, chat_username, chat_display_name, names):
     if not content or '<appmsg' not in content:
         return None
 
     _, sub_type = _split_msg_type(local_type)
-    root = _parse_xml_root(content)
-    if root is None and len(content) <= _RECORD_XML_PARSE_MAX_LEN:
-        # type=19 合并转发卡片 outer XML 可超过默认 20K，必要时用更宽上限重试，
-        # 否则展开链 _format_record_message_text → _parse_xml_root(record_node.text)
-        # 永远到不了，大合并消息会静默退化为 [链接/文件]。
-        root = _parse_xml_root(content, max_len=_RECORD_XML_PARSE_MAX_LEN)
+    root = _parse_app_message_outer(content)
     if root is None:
         return None
 
@@ -1919,7 +1925,7 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
     is_group = username.endswith('@chatroom')
     _, xml_text = _parse_message_content(xml_text, local_type, is_group)
 
-    root = _parse_xml_root(xml_text)
+    root = _parse_app_message_outer(xml_text)
     if root is None:
         return "无法解析消息 XML"
 
@@ -2121,7 +2127,7 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
     is_group = username.endswith('@chatroom')
     _, xml_text = _parse_message_content(xml_text, local_type, is_group)
 
-    root = _parse_xml_root(xml_text)
+    root = _parse_app_message_outer(xml_text)
     if root is None:
         return "无法解析消息 XML（可能不是合并转发消息）"
     appmsg = root.find('.//appmsg')
@@ -2186,12 +2192,10 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         sub = subdir_map.get(datatype, '*')
         idx_str = str(item_index)
 
-        # 精确文件名匹配（datatitle 可能含 [ ] * ? 等 glob 元字符，必须 escape）
+        # 精确文件名 + size 严格匹配（datatitle 可能含 glob 元字符，必须 escape）
         if datatitle:
             escaped_title = glob_mod.escape(datatitle)
             for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, escaped_title)):
-                # 有 datasize 时立刻 size 验证：避免命中"同名但 size 不对"的副本
-                # 阻塞兜底匹配，最终返回错误文件
                 if datasize:
                     try:
                         if os.path.getsize(hit) != datasize:
@@ -2201,18 +2205,12 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
                 if hit not in candidates:
                     candidates.append(hit)
 
-        # size 兜底匹配（任何文件名）
-        if not candidates and datasize:
+        # size only 兜底：仅在 datatitle 缺失（如 datatype=2 图片缩略图无标题）时启用，
+        # 限定在 sub-dir + item_index 子树内，避免跨多个 Rec 目录混合无关 record。
+        # 不再做更宽的 cross-subdir 终极兜底——它会让不同合并卡片中同名同 size 的
+        # 文件互相 leak，silent 返回错的 record。Codex round-2 high #2。
+        if not candidates and not datatitle and datasize:
             for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*', sub, idx_str, '*')):
-                try:
-                    if os.path.getsize(hit) == datasize:
-                        candidates.append(hit)
-                except OSError:
-                    pass
-
-        # 终极兜底：不限定 sub 目录
-        if not candidates and datasize:
-            for hit in glob_mod.glob(os.path.join(attach_dir, '*/Rec/*/*', idx_str, '*')):
                 try:
                     if os.path.getsize(hit) == datasize:
                         candidates.append(hit)
@@ -2229,21 +2227,33 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
             f"  解决方法: 在 wechat 客户端打开此合并记录卡片，点击第 {item_index + 1} 项让客户端下载，再试"
         )
 
-    if datasize:
-        size_match = [c for c in candidates if os.path.getsize(c) == datasize]
-        if size_match:
-            candidates = size_match
-    candidates.sort(key=lambda p: -os.path.getmtime(p))
-    chosen = candidates[0]
+    # Fail closed：多 candidates 时报歧义而不是 silent 选 mtime 最新。
+    # 不同合并卡片可能在 wechat 缓存里产生同 (filename, size, item_index) 的副本，
+    # 用 mtime 选最新会让用户拿到非自己 local_id 对应的 record 的文件。
+    if len(candidates) > 1:
+        from datetime import datetime as _dt
+        details = []
+        for c in candidates:
+            try:
+                mt = _dt.fromtimestamp(os.path.getmtime(c)).isoformat()
+            except OSError:
+                mt = '?'
+            details.append(f"{c} (mtime={mt})")
+        return (
+            f"找到 {len(candidates)} 个匹配的本地副本，无法唯一定位（可能其他合并卡片"
+            f"也含同名同 size 的同位置 dataitem）:\n  "
+            + '\n  '.join(details)
+            + f"\n请通过其他途径区分（人工 inspect mtime 或匹配上下文）"
+        )
 
-    extra = f"\n  其他候选: {len(candidates) - 1} 个" if len(candidates) > 1 else ""
+    chosen = candidates[0]
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  期望大小: {datasize:,} bytes\n"
         f"  发送者: {sourcename}\n"
-        f"  类型: [{type_label}] {datatitle or '(无标题)'}" + extra
+        f"  类型: [{type_label}] {datatitle or '(无标题)'}"
     )
 
 
