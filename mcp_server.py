@@ -1875,9 +1875,9 @@ def decode_file_message(chat_name: str, local_id: int) -> str:
     if not xml_text:
         return "消息 content 为空或无法解码"
 
-    # 剥离群聊 sender 前缀 "wxid_xxx:\n<xml...>"
-    if '<appmsg' in xml_text and ':\n' in xml_text and not xml_text.lstrip().startswith('<'):
-        xml_text = xml_text.split(':\n', 1)[1]
+    # 复用项目内现有 helper 剥离群聊 sender 前缀，避免自己写启发式
+    is_group = username.endswith('@chatroom')
+    _, xml_text = _parse_message_content(xml_text, local_type, is_group)
 
     root = _parse_xml_root(xml_text)
     if root is None:
@@ -2043,8 +2043,9 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int) -> str:
     if not xml_text:
         return "消息 content 为空或无法解码"
 
-    if '<appmsg' in xml_text and ':\n' in xml_text and not xml_text.lstrip().startswith('<'):
-        xml_text = xml_text.split(':\n', 1)[1]
+    # 复用项目内现有 helper 剥离群聊 sender 前缀，避免自己写启发式
+    is_group = username.endswith('@chatroom')
+    _, xml_text = _parse_message_content(xml_text, local_type, is_group)
 
     root = _parse_xml_root(xml_text)
     if root is None:
