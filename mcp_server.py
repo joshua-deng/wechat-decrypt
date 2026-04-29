@@ -560,6 +560,40 @@ def _resolve_quote_sender_label(ref_user, ref_display_name, is_group, chat_usern
 _RECORD_XML_PARSE_MAX_LEN = 500_000
 
 
+def _safe_basename(name):
+    """对 user-derived filename（从消息 XML 来，不可信）做严格 sanitize。
+
+    Codex adversarial round 4 建议"reject suspicious input"而不是 normalize：
+    哪怕 os.path.basename 把 '../foo' 剥成 'foo' 是 safe 的，意图依然可疑，
+    应该让工具显式失败让用户看到，而不是默默 normalize 接受。
+    """
+    if not name:
+        return ''
+    if '\x00' in name:
+        return ''
+    if os.path.isabs(name):
+        return ''
+    # 任何 path separator 或 .. component 直接拒（不做 normalize）
+    parts = name.replace('\\', '/').split('/')
+    if any(p in ('', '.', '..') for p in parts) and len(parts) > 1:
+        return ''
+    if len(parts) > 1:
+        return ''
+    if name in ('.', '..'):
+        return ''
+    return name
+
+
+def _path_under_root(path, root):
+    """resolve realpath 后确认仍在 root 下（防 symlink 跳出）。"""
+    try:
+        real_path = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return False
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
 def _parse_xml_root(content, max_len=_XML_PARSE_MAX_LEN):
     if not content or len(content) > max_len or _XML_UNSAFE_RE.search(content):
         return None
@@ -1943,7 +1977,7 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
             f"type=5/33/36/44 等是链接/小程序，没有可下载的本地文件"
         )
 
-    title = _collapse_text(appmsg.findtext('title') or '')
+    raw_title = _collapse_text(appmsg.findtext('title') or '')
     fileext = _collapse_text(appmsg.findtext('.//fileext') or '')
     totallen = _parse_int(_collapse_text(appmsg.findtext('.//totallen') or ''), 0)
 
@@ -1951,8 +1985,14 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
     if appmsg.find('appattach') is None:
         return "消息没有 appattach 节点（可能 schema 异常或不是真文件消息）"
 
-    if not title:
+    if not raw_title:
         return "消息中没有文件名 (title)"
+
+    # title 来自不可信的 message XML，对方可能发恶意消息（含绝对路径或 ../）。
+    # 必须 sanitize 成 safe basename 才能拼路径 + glob，否则有 path-traversal 风险。
+    title = _safe_basename(raw_title)
+    if not title:
+        return f"消息中的文件名 {raw_title!r} 不安全（含绝对路径/路径分隔符/..），拒绝处理"
 
     # 性能优化：先按消息时间精确定位 msg/file/{YYYY-MM}/，命中即返回；
     # 否则才退回 walk 全盘 os.walk（msg/attach 含数十万小文件，全盘扫描可达数秒）
@@ -2049,12 +2089,20 @@ def decode_file_message(chat_name: str, local_id: int, create_time: int = 0) -> 
         )
 
     chosen = candidates[0]
+    # realpath 二次验证：拼接后仍在 wechat 缓存根下（防 symlink 跳出）
+    cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
+    if not _path_under_root(chosen, cache_root):
+        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  扩展名: {fileext or os.path.splitext(title)[1].lstrip('.') or '?'}\n"
-        f"  期望大小: {totallen:,} bytes"
+        f"  期望大小: {totallen:,} bytes\n"
+        f"  ⚠️  此路径基于 (filename + size) 启发式匹配，没有从 wechat 元数据"
+        f"派生唯一证据证明它属于 local_id={local_id} 的消息。如果同 chat 缓存里"
+        f"另有同名同 size 的不相关文件，本工具可能返回错副本。请人工验证 mtime"
+        f"/路径上下文，或使用 Read 工具校对内容是否符合预期。"
     )
 
 
@@ -2176,7 +2224,11 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
 
     item = items[item_index]
     datatype = (item.get('datatype') or '').strip()
-    datatitle = _collapse_text(item.findtext('datatitle') or '')
+    raw_datatitle = _collapse_text(item.findtext('datatitle') or '')
+    # datatitle 来自不可信 XML，sanitize 防 path traversal
+    datatitle = _safe_basename(raw_datatitle) if raw_datatitle else ''
+    if raw_datatitle and not datatitle:
+        return f"该 dataitem 的 datatitle {raw_datatitle!r} 不安全（含绝对路径/分隔符/..），拒绝处理"
     datasize = _parse_int(_collapse_text(item.findtext('datasize') or ''), 0)
     datafmt = _collapse_text(item.findtext('datafmt') or '')
     sourcename = _collapse_text(item.findtext('sourcename') or '')
@@ -2277,13 +2329,21 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         )
 
     chosen = candidates[0]
+    # realpath 二次验证：拼接后仍在 wechat 缓存根下（防 symlink 跳出）
+    cache_root = os.path.join(WECHAT_BASE_DIR, 'msg')
+    if not _path_under_root(chosen, cache_root):
+        return f"匹配到的路径 {chosen!r} 不在 {cache_root} 下，拒绝返回（可能是 symlink 攻击）"
     return (
         f"找到本地文件:\n"
         f"  路径: {chosen}\n"
         f"  大小: {os.path.getsize(chosen):,} bytes\n"
         f"  期望大小: {datasize:,} bytes\n"
         f"  发送者: {sourcename}\n"
-        f"  类型: [{type_label}] {datatitle or '(无标题)'}"
+        f"  类型: [{type_label}] {datatitle or '(无标题)'}\n"
+        f"  ⚠️  此路径基于 (item_index + filename + size) 启发式匹配，无法从"
+        f"wechat 元数据派生唯一证据证明它属于 local_id={local_id} 的这条 record。"
+        f"如果同 chat 内多条合并卡片碰巧含同位置同名同 size 的文件，本工具可能"
+        f"返回别条 record 的副本。请用 mtime 或人工 inspect 校对。"
     )
 
 
