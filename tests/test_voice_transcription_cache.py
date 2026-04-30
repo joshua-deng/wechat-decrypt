@@ -194,7 +194,7 @@ class TranscribeVoiceCacheHitTests(_CacheIsolationMixin, unittest.TestCase):
             "text": "缓存命中文本",
             "language": "zh",
             "create_time": 1700000000,
-            "model_size": mcp_server.DEFAULT_WHISPER_MODEL,
+            "model_size": mcp_server.LOCAL_WHISPER_MODEL,
         })
 
         with patch.object(mcp_server, "resolve_username", return_value="wxid_test") as mock_resolve, \
@@ -216,7 +216,7 @@ class TranscribeVoiceCacheHitTests(_CacheIsolationMixin, unittest.TestCase):
         self._seed(key, {
             "text": "历史条目",
             "language": "zh",
-            "model_size": mcp_server.DEFAULT_WHISPER_MODEL,
+            "model_size": mcp_server.LOCAL_WHISPER_MODEL,
         })
 
         with patch.object(mcp_server, "resolve_username", return_value="wxid_test"), \
@@ -233,7 +233,7 @@ class TranscribeVoiceCacheHitTests(_CacheIsolationMixin, unittest.TestCase):
             "text": "",
             "language": "zh",
             "create_time": 1700000000,
-            "model_size": mcp_server.DEFAULT_WHISPER_MODEL,
+            "model_size": mcp_server.LOCAL_WHISPER_MODEL,
         })
 
         with patch.object(mcp_server, "resolve_username", return_value="wxid_test"), \
@@ -244,7 +244,7 @@ class TranscribeVoiceCacheHitTests(_CacheIsolationMixin, unittest.TestCase):
         self.assertIn("(zh)", result)
 
     def test_model_mismatch_is_treated_as_miss(self):
-        # 缓存条目的 model_size 和当前 DEFAULT_WHISPER_MODEL 不一致时，
+        # 缓存条目的 model_size 和当前 LOCAL_WHISPER_MODEL 不一致时，
         # 不应命中；进入 miss 路径（这里无 whisper 依赖，应落到"缺少依赖"分支）。
         key = mcp_server._voice_transcription_cache_key("wxid_test", 10)
         self._seed(key, {

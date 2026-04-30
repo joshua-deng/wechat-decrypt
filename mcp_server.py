@@ -1971,16 +1971,123 @@ def _save_voice_transcription_cache():
                 pass
 
 
-DEFAULT_WHISPER_MODEL = "base"
+# ============ 语音转录后端 ============
+#
+# 默认 local: 完全保留原有行为，CPU 上跑本地 Whisper。
+# opt-in openai: 需要 transcription_backend="openai" 且 openai_api_key 都齐
+# 才会上云；任一缺失静默回退 local + stderr 一行警告（用户感知到误配置但不阻塞）。
+# 详见 README "语音转录隐私" 章节。
+
+TRANSCRIPTION_BACKEND = _cfg.get("transcription_backend", "local")
+LOCAL_WHISPER_MODEL = _cfg.get("local_whisper_model", "base")
+OPENAI_API_KEY = _cfg.get("openai_api_key", "")
+
+OPENAI_WHISPER_MODEL = "whisper-1"           # OpenAI 当前唯一型号
+OPENAI_AUDIO_LIMIT_BYTES = 25 * 1024 * 1024  # OpenAI 25MB 上限
 
 _whisper_model = None
+_openai_client = None
+_openai_warning_emitted = False
+_fallback_warning_emitted = False
 
-def _get_whisper_model(model_size=DEFAULT_WHISPER_MODEL):
+
+def _resolve_active_backend():
+    """两因素 opt-in：openai 需要 flag + key 都齐才生效。"""
+    global _fallback_warning_emitted
+    if TRANSCRIPTION_BACKEND == "openai":
+        if not OPENAI_API_KEY:
+            if not _fallback_warning_emitted:
+                print(
+                    "[whisper] transcription_backend=openai 但未配置 openai_api_key，"
+                    "回退到本地模型",
+                    file=sys.stderr, flush=True,
+                )
+                _fallback_warning_emitted = True
+            return "local"
+        return "openai"
+    return "local"
+
+
+def _cache_signature():
+    """当前生效后端 + 模型，用作缓存命中判定 + 落盘字段。"""
+    backend = _resolve_active_backend()
+    if backend == "openai":
+        return {"backend": "openai", "model_size": OPENAI_WHISPER_MODEL}
+    return {"backend": "local", "model_size": LOCAL_WHISPER_MODEL}
+
+
+def _get_whisper_model(model_size=None):
     global _whisper_model
+    if model_size is None:
+        model_size = LOCAL_WHISPER_MODEL
     if _whisper_model is None:
         import whisper
         _whisper_model = whisper.load_model(model_size)
     return _whisper_model
+
+
+def _transcribe_local(wav_path):
+    model = _get_whisper_model()
+    result = model.transcribe(wav_path)
+    return {
+        "language": result.get("language", "unknown"),
+        "text": result.get("text", "").strip(),
+    }
+
+
+def _transcribe_openai(wav_path):
+    """通过 OpenAI Whisper API 转录。失败抛 RuntimeError，调用方负责面向用户的提示。"""
+    global _openai_client, _openai_warning_emitted
+
+    # 尺寸预检：放在 SDK 导入和实例化之前，确保超限文件绝不上传
+    size = os.path.getsize(wav_path)
+    if size > OPENAI_AUDIO_LIMIT_BYTES:
+        raise RuntimeError(
+            f"音频 {size / 1024 / 1024:.1f}MB 超过 OpenAI 25MB 上限，"
+            "提前拒绝以避免无谓上传"
+        )
+
+    try:
+        from openai import OpenAI
+        from openai import AuthenticationError, RateLimitError, APIError
+    except ImportError:
+        raise RuntimeError("缺少依赖: pip install openai")
+
+    if not _openai_warning_emitted:
+        print(
+            "[whisper] 已启用 OpenAI Whisper API，"
+            "语音将上传至 OpenAI 服务器进行转录",
+            file=sys.stderr, flush=True,
+        )
+        _openai_warning_emitted = True
+
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+    try:
+        with open(wav_path, "rb") as f:
+            result = _openai_client.audio.transcriptions.create(
+                model=OPENAI_WHISPER_MODEL,
+                file=f,
+                response_format="verbose_json",
+            )
+    except AuthenticationError:
+        raise RuntimeError("OpenAI 鉴权失败 (401)：检查 openai_api_key")
+    except RateLimitError:
+        raise RuntimeError("OpenAI 限流 (429)：稍后重试")
+    except APIError as e:
+        raise RuntimeError(f"OpenAI API 错误: {e}")
+
+    return {
+        "language": getattr(result, "language", "unknown"),
+        "text": (getattr(result, "text", "") or "").strip(),
+    }
+
+
+def _transcribe(wav_path, backend):
+    if backend == "openai":
+        return _transcribe_openai(wav_path)
+    return _transcribe_local(wav_path)
 
 
 @mcp.tool()
@@ -1989,10 +2096,16 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
 
     首次转录会先解码 SILK 语音为 WAV，再用 Whisper 转录；结果缓存到
     voice_transcriptions.json，重复调用直接返回缓存（跳过 SILK 解码
-    和 Whisper 推理）。若 Whisper 默认模型升级（如 base → small），
-    旧条目自动视为失效并重新转录。首次运行会下载 Whisper 模型（约 145MB）。
+    和 Whisper 推理）。后端切换或本地模型升级（如 base → small）后，
+    旧条目自动视为失效并重新转录。首次运行本地模型会下载约 145MB 权重。
 
-    依赖: pip install silk-python openai-whisper (silk-python 的 import 名为 pysilk)
+    后端由 config.json 中 transcription_backend 字段控制（local/openai）。
+    详见 README "语音转录隐私" 章节。
+
+    依赖:
+      - 本地后端: pip install silk-python openai-whisper
+        (silk-python 的 import 名为 pysilk)
+      - OpenAI 后端: pip install silk-python openai
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
@@ -2002,15 +2115,20 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
     if not username:
         return f"找不到聊天对象: {chat_name}"
 
+    sig = _cache_signature()
     cache_key = _voice_transcription_cache_key(username, local_id)
     cache = _load_voice_transcription_cache()
     entry = cache.get(cache_key)
+    # 命中要求 backend + model_size 都匹配。
+    # 旧条目 (PR #58 schema) 缺 backend 字段，回填默认 "local" 保持向前兼容
+    # —— 那时唯一存在的后端就是 local，语义上等价。
     if (
         isinstance(entry, dict)
         and "text" in entry
-        and entry.get("model_size") == DEFAULT_WHISPER_MODEL
+        and entry.get("backend", "local") == sig["backend"]
+        and entry.get("model_size") == sig["model_size"]
     ):
-        # 命中缓存：跳过 DB 查询、SILK 解码、Whisper 推理。
+        # 命中缓存：跳过 DB 查询、SILK 解码、转录。
         # 条目里存了 create_time，即使源 DB 中消息已被清理仍能返回历史转录。
         lang = entry.get("language", "unknown")
         cached_ts = entry.get("create_time")
@@ -2020,11 +2138,13 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
             time_label = "-"
         return f"[{time_label}] ({lang})\n{entry['text']}"
 
-    # 未命中：只有这条路径才需要 whisper / pysilk。
-    try:
-        import whisper  # noqa: F401
-    except ImportError:
-        return "缺少依赖: pip install openai-whisper"
+    # 未命中：本地后端才需要 whisper 包，云后端在 _transcribe_openai 内单独检查
+    if sig["backend"] == "local":
+        try:
+            import whisper  # noqa: F401
+        except ImportError:
+            return "缺少依赖: pip install openai-whisper"
+    # SILK 解码两条路径都需要
     try:
         import pysilk  # noqa: F401
     except ImportError:
@@ -2037,18 +2157,21 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
     voice_data, create_time = row
     wav_path, _ = _silk_to_wav(voice_data, create_time, username, local_id)
 
-    model = _get_whisper_model()
-    result = model.transcribe(wav_path)
-    lang = result.get("language", "unknown")
-    text = result.get("text", "").strip()
+    try:
+        result = _transcribe(wav_path, sig["backend"])
+    except RuntimeError as e:
+        return str(e)
+    text = result["text"]
+    lang = result["language"]
 
     # 写缓存：即使 text 为空也缓存（Whisper 偶尔对静音/极短片段返回空），
-    # 配合 model_size 字段，升级模型后会自动重转，避免永久钉死空结果。
+    # 配合 backend + model_size 字段，切换后端或升级模型后会自动重转。
     cache[cache_key] = {
         "text": text,
         "language": lang,
         "create_time": int(create_time),
-        "model_size": DEFAULT_WHISPER_MODEL,
+        "backend": sig["backend"],
+        "model_size": sig["model_size"],
     }
     _save_voice_transcription_cache()
 

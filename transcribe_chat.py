@@ -13,10 +13,12 @@
     .venv/bin/python3 transcribe_chat.py /tmp/chat.json /tmp/chat_transcribed.json
 
 行为说明:
-    - 使用 OpenAI Whisper (CPU，单线程) 对每条语音消息转录。
+    - 后端由 config.json 中 transcription_backend 字段控制 (local/openai)，
+      与 MCP transcribe_voice 工具共享配置。详见 README "语音转录隐私" 章节。
+    - 默认 local: 使用本地 Whisper (CPU，单线程)，首次运行下载 ~145 MB 权重。
+    - 切到 openai: 语音上传至 OpenAI 服务器转录 (~$0.006/分钟)。
     - 幂等: 已有 "transcription" 字段的消息会被跳过，因此崩溃/中断后可安全重跑。
     - 崩溃安全: 每处理完一条即整体重写输出 JSON，进程中断最多丢失当前一条。
-    - 首次运行会下载 Whisper 模型 (~145 MB) 并缓存。
 
 需要 WeChat DB 仍然在线/已解密 —— 语音 blob 是从 DB 现场按 local_id 读取的，
 不从 JSON 读。
@@ -29,7 +31,7 @@ from datetime import datetime
 import mcp_server
 
 
-def _transcribe_local_id(username, local_id):
+def _transcribe_local_id(username, local_id, backend):
     row = mcp_server._fetch_voice_row(username, local_id)
     if row is None:
         return "[not found]"
@@ -41,9 +43,8 @@ def _transcribe_local_id(username, local_id):
         return f"[decode error: {e}]"
 
     try:
-        model = mcp_server._get_whisper_model()
-        result = model.transcribe(wav_path)
-        return result.get("text", "").strip()
+        result = mcp_server._transcribe(wav_path, backend)
+        return result["text"]
     except Exception as e:
         return f"[transcribe error: {e}]"
 
@@ -70,17 +71,22 @@ def transcribe_export(input_path, output_path):
         print("No voice messages to transcribe.")
         return
 
+    backend = mcp_server._resolve_active_backend()
     print(f"Found {total} voice messages to transcribe.")
-    print("Loading Whisper model (first run downloads ~145MB)...")
-    mcp_server._get_whisper_model()
-    print("Model ready.\n")
+    print(f"Backend: {backend}")
+    if backend == "local":
+        print("Loading Whisper model (first run downloads ~145MB)...")
+        mcp_server._get_whisper_model()
+        print("Model ready.\n")
+    else:
+        print("")
 
     for i, msg in enumerate(pending, 1):
         local_id = msg["local_id"]
         ts = msg["timestamp"]
         ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, (int, float)) else ts
         print(f"[{i}/{total}] local_id={local_id} ({ts_str}) ... ", end="", flush=True)
-        result = _transcribe_local_id(username, local_id)
+        result = _transcribe_local_id(username, local_id, backend)
         msg["transcription"] = result
         print(repr(result[:60]) if result else '""')
 

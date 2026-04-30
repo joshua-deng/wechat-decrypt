@@ -196,10 +196,34 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
 | `get_contact_tags()` | 列出所有联系人标签及成员数量 |
 | `get_tag_members(tag_name)` | 获取指定标签下的所有联系人，支持模糊匹配 |
 | `get_new_messages()` | 获取自上次调用以来的新消息 |
+| `get_voice_messages(chat_name)` | 列出某会话所有语音消息（local_id、时长、时间戳） |
+| `decode_voice(chat_name, local_id)` | 解码 SILK 语音为本地 WAV 文件 |
+| `transcribe_voice(chat_name, local_id)` | 转录语音为文字（自动检测语言） |
 
 前置条件：需要先运行 `python main.py` 或 `python find_all_keys.py` 完成密钥提取。
 
 说明：`search_messages` 的 `limit` 最大为 `500`；`get_chat_history` 支持更大的 `limit`，但消息很多时仍建议配合 `offset` 分页读取。
+
+#### ⚠️ 语音转录隐私
+
+`transcribe_voice` 默认使用本地 Whisper（CPU），数据全程留在本机。`transcribe_chat.py` 批量 CLI 共享同一份配置。
+
+如需切换到 OpenAI Whisper API（更快、Mandarin 精度更高），在 `config.json` 中：
+
+```json
+{
+    "transcription_backend": "openai",
+    "openai_api_key": "sk-..."
+}
+```
+
+启用后**语音文件会上传至 OpenAI 服务器**进行转录。需 `pip install openai`。
+
+- 成本：约 $0.006 / 分钟（OpenAI 计价）
+- 文件 > 25MB 在上传前被拒绝（OpenAI 上限）
+- 首次启用云后端时 stderr 会打一行警告
+- `transcription_backend` 或 `openai_api_key` 任一缺失时静默回退 local
+- 切换后端后，旧缓存条目（backend 不匹配）会自动重新转录
 
 **[查看使用案例 →](USAGE.md)**
 
