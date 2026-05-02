@@ -2,8 +2,11 @@
 
 不依赖真实微信数据；用 tempdir + 合成密文构造测试。
 """
+import hashlib
 import json
+import multiprocessing
 import os
+import queue as _queue_mod
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -577,7 +580,11 @@ class BruteforceUinCandidatesTests(unittest.TestCase):
 
 
 class FindViaBruteforceTests(unittest.TestCase):
-    """方案2 端到端 (mock bruteforce 加速)。"""
+    """方案2 端到端 (合成 fixture, 多进程 worker 实跑)。
+
+    注: parallel 路径在合成 uin (低数值, 在 worker 0 chunk 早期命中) 上
+    < 0.2s 完成, 不需要 mock 加速。worker spawn 开销是真实集成测试的合理代价。
+    """
 
     def _build_bruteforce_env(self, tmp, uin, wxid_norm, suffix):
         wxid_full = f"{wxid_norm}_{suffix}"
@@ -597,14 +604,12 @@ class FindViaBruteforceTests(unittest.TestCase):
                         + b"\x00" * 4 + bytes([last_byte]))
         return db_dir, attach_dir, xor_exp, aes_exp
 
-    def test_full_flow_with_mocked_bruteforce(self):
+    def test_full_flow_finds_synthetic_uin(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_dir, attach_dir, xor_exp, aes_exp = self._build_bruteforce_env(
                 tmp, uin=12345678, wxid_norm="your_wxid", suffix="25d5")
             templates = fkm.find_v2_template_ciphertexts(attach_dir)
-            with patch.object(fkm, "bruteforce_uin_candidates",
-                              return_value=[12345678]):
-                result = fkm._find_via_bruteforce(db_dir, attach_dir, templates)
+            result = fkm._find_via_bruteforce(db_dir, attach_dir, templates)
             self.assertEqual(result, (xor_exp, aes_exp))
 
     def test_returns_none_when_no_wxid_suffix(self):
@@ -650,13 +655,87 @@ class DispatcherFallbackTests(unittest.TestCase):
                     f.write(fkm.V2_MAGIC + b"\x00" * 9 + ct
                             + b"\x00" * 4 + bytes([last_byte]))
 
-            # patch HOME 让兜底 kvcomm 路径也找不到
-            # mock bruteforce 加速 (只返回真 uin)
-            with patch("os.path.expanduser", return_value=tmp), \
-                 patch.object(fkm, "bruteforce_uin_candidates",
-                              return_value=[uin]):
+            # patch HOME 让兜底 kvcomm 路径也找不到, 强制走方案2
+            with patch("os.path.expanduser", return_value=tmp):
                 result = fkm.find_image_key_macos(db_dir)
             self.assertEqual(result, (xor_exp, aes_exp))
+
+
+class BruteforceParallelTests(unittest.TestCase):
+    """方案2 多进程实现的两层覆盖:
+    - 算法核心 (_bruteforce_worker_chunk): 直接调用, 无 process spawn, 极快
+    - 集成 (_bruteforce_with_aes_parallel): workers=1 验证 spawn + pickle 链路
+
+    多进程 e2e 由 FindViaBruteforceTests / DispatcherFallbackTests 间接覆盖
+    (cpu_count workers, 真实 fixture)。这里只测函数契约, 避免 spawn 开销
+    被反复支付。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # 合成 fixture, 跨多个测试复用
+        cls.uin = 12345678
+        cls.xor_key = cls.uin & 0xFF  # 0x4E
+        cls.wxid_norm = "your_wxid"
+        cls.suffix_hex = hashlib.md5(str(cls.uin).encode()).hexdigest()[:4]
+        cls.suffix_bytes = bytes.fromhex(cls.suffix_hex)
+        cls.aes_hex = hashlib.md5(
+            f"{cls.uin}{cls.wxid_norm}".encode()
+        ).hexdigest()[:16]
+        cls.template = AES.new(
+            cls.aes_hex.encode("ascii"), AES.MODE_ECB
+        ).encrypt(b"\xff\xd8\xff\xe0" + b"\x00" * 12)
+        # i = (uin - xor_key) >> 8: worker 用 i 索引, 主进程倒推区间
+        cls.target_i = (cls.uin - cls.xor_key) >> 8
+
+    # 注: multiprocessing.Queue.put() 通过 feeder thread 异步刷到 pipe,
+    # get_nowait() 读取会 race。所有 queue 读用 get(timeout=...):
+    # - 命中场景: timeout=2s 给 feeder 充足时间 (实际 ~ms 级)
+    # - 不命中场景: timeout=0.5s 既证空又不拖慢测试
+
+    def test_worker_finds_known_uin_in_chunk(self):
+        q = multiprocessing.Queue()
+        fkm._bruteforce_worker_chunk(
+            self.target_i - 50, self.target_i + 50,
+            self.xor_key, self.suffix_bytes,
+            self.wxid_norm.encode("ascii"),
+            [self.template], q,
+        )
+        result = q.get(timeout=2)
+        self.assertEqual(result, (self.uin, self.aes_hex))
+
+    def test_worker_no_match_returns_silently(self):
+        # 区间不含 target_i (~48k), worker 扫完, queue 应保持空
+        q = multiprocessing.Queue()
+        fkm._bruteforce_worker_chunk(
+            0, 1000,
+            self.xor_key, self.suffix_bytes,
+            self.wxid_norm.encode("ascii"),
+            [self.template], q,
+        )
+        with self.assertRaises(_queue_mod.Empty):
+            q.get(timeout=0.5)
+
+    def test_worker_skips_when_aes_fails(self):
+        # md5 prefix 命中但 AES 模板错: 不入队 (防止 md5 单 gate 假阳)
+        q = multiprocessing.Queue()
+        wrong_template = b"\x00" * 16  # AES 解出来非图像 magic
+        fkm._bruteforce_worker_chunk(
+            self.target_i - 50, self.target_i + 50,
+            self.xor_key, self.suffix_bytes,
+            self.wxid_norm.encode("ascii"),
+            [wrong_template], q,
+        )
+        with self.assertRaises(_queue_mod.Empty):
+            q.get(timeout=0.5)
+
+    def test_parallel_workers_1_finds_synthetic_uin(self):
+        # 集成: workers=1 验证 process spawn + pickle + queue 跨进程通信
+        result = fkm._bruteforce_with_aes_parallel(
+            self.xor_key, self.suffix_hex, self.wxid_norm,
+            [self.template], workers=1, timeout=30,
+        )
+        self.assertEqual(result, (self.uin, self.aes_hex))
 
 
 class SaveConfigAtomicTests(unittest.TestCase):
