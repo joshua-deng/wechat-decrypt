@@ -45,15 +45,16 @@ class DeriveImageKeysTests(unittest.TestCase):
         self.assertEqual(fkm.derive_image_keys(0x00, "x")[0], 0x00)
 
     def test_aes_is_md5_hex_truncated_to_16(self):
-        # Golden value：来自 POC 在真实微信数据上的验证（issue #23 解的就是这一对）
-        xor, aes = fkm.derive_image_keys(18709375, "your_wxid")
-        self.assertEqual(xor, 0x7F)
-        self.assertEqual(aes, "b73bd4126969d30f")
+        # Golden value: 合成 fixture (uin=12345678) 派生; 算法正确性由公式
+        # md5(str(uin)+wxid)[:16] 决定, 测试值无需对应任何真实账号。
+        xor, aes = fkm.derive_image_keys(12345678, "your_wxid")
+        self.assertEqual(xor, 0x4E)  # 12345678 & 0xFF
+        self.assertEqual(aes, "a0c093edddc98490")
 
     def test_aes_does_not_normalize_wxid_internally(self):
         # 归一化由调用方负责；不同 wxid 字符串产出不同 key
-        _, aes_full = fkm.derive_image_keys(18709375, "your_wxid_a1b2")
-        _, aes_norm = fkm.derive_image_keys(18709375, "your_wxid")
+        _, aes_full = fkm.derive_image_keys(12345678, "your_wxid_a1b2")
+        _, aes_norm = fkm.derive_image_keys(12345678, "your_wxid")
         self.assertNotEqual(aes_full, aes_norm)
 
 
@@ -125,12 +126,14 @@ class CollectKvcommCodesTests(unittest.TestCase):
             f.write("")
 
     def test_extracts_code_from_filename(self):
-        self._touch("key_18709375_4066645761_1_1777096531_137785059_3600_input.statistic")
+        # 长格式: 模拟真实 kvcomm 缓存文件命名 (合成 ID/时间戳, 测 regex 提
+        # uin 的能力, 不绑定任何真实账号)
+        self._touch("key_12345678_1111111111_1_1700000000_22222_3600_input.statistic")
         self._touch("key_99999999_yyy_zzz.statistic")
-        self.assertEqual(fkm.collect_kvcomm_codes(self.kvdir), [18709375, 99999999])
+        self.assertEqual(fkm.collect_kvcomm_codes(self.kvdir), [12345678, 99999999])
 
     def test_ignores_files_with_non_numeric_first_segment(self):
-        self._touch("key_reportnow_18709375_xxx.statistic")
+        self._touch("key_reportnow_12345678_xxx.statistic")
         self._touch("key_abc_def.statistic")
         self._touch("config.ini")
         self._touch("monitordata_x")
@@ -166,7 +169,7 @@ class CollectWxidCandidatesTests(unittest.TestCase):
 
 
 class VerifyAesKeyTests(unittest.TestCase):
-    KEY = "b73bd4126969d30f"
+    KEY = "a0c093edddc98490"
 
     def _encrypt(self, plaintext_16):
         return AES.new(self.KEY.encode("ascii"), AES.MODE_ECB).encrypt(plaintext_16)
@@ -204,7 +207,7 @@ class VerifyAesKeyTests(unittest.TestCase):
 class VerifyAesKeyAgainstAllTests(unittest.TestCase):
     """交叉验证：必须所有模板都通过才算命中（防短 magic 偶然碰撞）。"""
 
-    KEY = "b73bd4126969d30f"
+    KEY = "a0c093edddc98490"
 
     def _encrypt(self, plaintext_16):
         return AES.new(self.KEY.encode("ascii"), AES.MODE_ECB).encrypt(plaintext_16)
@@ -322,7 +325,7 @@ class FindImageKeyMacosIntegrationTests(unittest.TestCase):
     def test_full_flow_succeeds_with_normalized_wxid(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_dir, xor_exp, aes_exp = self._build_test_env(
-                tmp, code=18709375, wxid_raw="your_wxid_a1b2", num_templates=3)
+                tmp, code=12345678, wxid_raw="your_wxid_a1b2", num_templates=3)
             result = fkm.find_image_key_macos(db_dir)
             self.assertIsNotNone(result, "派生应该成功")
             self.assertEqual(result, (xor_exp, aes_exp))
@@ -462,10 +465,10 @@ class ExtractWxidPartsTests(unittest.TestCase):
     """extract_wxid_parts: 从 db_dir 提 (full, norm, suffix)。"""
 
     def test_extracts_norm_and_suffix_from_alnum_suffix(self):
-        db_dir = "/foo/Documents/xwechat_files/your_wxid_626a/db_storage"
+        db_dir = "/foo/Documents/xwechat_files/your_wxid_25d5/db_storage"
         self.assertEqual(
             fkm.extract_wxid_parts(db_dir),
-            ("your_wxid_626a", "your_wxid", "626a"),
+            ("your_wxid_25d5", "your_wxid", "25d5"),
         )
 
     def test_wxid_format_with_4char_suffix(self):
@@ -560,15 +563,15 @@ class BruteforceUinCandidatesTests(unittest.TestCase):
     """
 
     def test_real_bruteforce_against_golden(self):
-        # 真跑全空间 2^24 候选, 同时验证: (a) 真 uin 在结果里
+        # 真跑全空间 2^24 候选, 同时验证: (a) 合成 uin 在结果里
         # (b) 候选数合理 (~256) (c) 候选都满足 xor_key 约束
-        # md5("18709375")[:4] == "626a", 18709375 & 0xff == 0x7F
-        out = fkm.bruteforce_uin_candidates(0x7F, "626a")
-        self.assertIn(18709375, out, "真 uin 应在候选里")
+        # md5("12345678")[:4] == "25d5", 12345678 & 0xff == 0x4E
+        out = fkm.bruteforce_uin_candidates(0x4E, "25d5")
+        self.assertIn(12345678, out, "合成 uin 应在候选里")
         self.assertTrue(200 <= len(out) <= 350,
                         f"候选数 {len(out)} 偏离 ~256 (理论 2^24/2^16)")
         for uin in out[:20]:
-            self.assertEqual(uin & 0xFF, 0x7F,
+            self.assertEqual(uin & 0xFF, 0x4E,
                              f"uin {uin} 不满足 xor_key 约束")
 
 
@@ -597,10 +600,10 @@ class FindViaBruteforceTests(unittest.TestCase):
     def test_full_flow_with_mocked_bruteforce(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_dir, attach_dir, xor_exp, aes_exp = self._build_bruteforce_env(
-                tmp, uin=18709375, wxid_norm="your_wxid", suffix="626a")
+                tmp, uin=12345678, wxid_norm="your_wxid", suffix="25d5")
             templates = fkm.find_v2_template_ciphertexts(attach_dir)
             with patch.object(fkm, "bruteforce_uin_candidates",
-                              return_value=[18709375]):
+                              return_value=[12345678]):
                 result = fkm._find_via_bruteforce(db_dir, attach_dir, templates)
             self.assertEqual(result, (xor_exp, aes_exp))
 
@@ -616,7 +619,7 @@ class FindViaBruteforceTests(unittest.TestCase):
     def test_returns_none_when_no_v2_dat(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = os.path.join(tmp, "Documents", "xwechat_files",
-                                "your_wxid_626a")
+                                "your_wxid_25d5")
             db_dir = os.path.join(base, "db_storage")
             attach_dir = os.path.join(base, "msg", "attach")
             os.makedirs(db_dir)
@@ -629,7 +632,7 @@ class DispatcherFallbackTests(unittest.TestCase):
 
     def test_kvcomm_missing_falls_back_to_bruteforce(self):
         with tempfile.TemporaryDirectory() as tmp:
-            uin, wxid_norm, suffix = 18709375, "your_wxid", "626a"
+            uin, wxid_norm, suffix = 12345678, "your_wxid", "25d5"
             wxid_full = f"{wxid_norm}_{suffix}"
             base = os.path.join(tmp, "Documents", "xwechat_files", wxid_full)
             db_dir = os.path.join(base, "db_storage")

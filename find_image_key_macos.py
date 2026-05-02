@@ -257,7 +257,7 @@ def extract_wxid_parts(db_dir):
     """从 db_dir 提取 (wxid_full, wxid_norm, suffix)。
 
     db_dir 形如 .../xwechat_files/<wxid>_<4hex>/db_storage
-    返回 ('A_Hare_626a', 'A_Hare', '626a') 或 None（不匹配 _<4 hex> 后缀）。
+    返回 ('your_wxid_a1b2', 'your_wxid', 'a1b2') 或 None（不匹配 _<4 hex> 后缀）。
 
     suffix 是 4 位小写 hex（macOS 路径目录名固定格式 = md5(str(uin))[:4]），
     用作方案2 中候选搜索的 md5 前缀目标。
