@@ -45,10 +45,13 @@ uin 来源（两条路径，dispatcher 自动 fallback）
 """
 import hashlib
 import json
+import multiprocessing
 import os
 import platform
+import queue as _queue
 import re
 import sys
+import time
 from collections import Counter
 
 from Crypto.Cipher import AES
@@ -324,6 +327,10 @@ def bruteforce_uin_candidates(xor_key, wxid_suffix):
 
     注意 uin 上限假设为 2^32（4 字节无符号整数）。函数命名沿用密码学
     候选搜索的 brute-force 术语；中文 prose 用 "枚举 / 候选搜索" 表述。
+
+    本函数是单进程 + hex 比较版本, 主要用作算法金标准 (测试) 与
+    parallel 路径不可用时的 fallback。生产 dispatcher 走 parallel
+    版本 (见 `_bruteforce_with_aes_parallel`)。
     """
     target = wxid_suffix.lower()
     out = []
@@ -331,6 +338,97 @@ def bruteforce_uin_candidates(xor_key, wxid_suffix):
         if hashlib.md5(str(uin).encode()).hexdigest()[:4] == target:
             out.append(uin)
     return out
+
+
+def _aes_template_match(aes_bytes, ciphertext):
+    """worker 进程内: AES-128-ECB 解 ciphertext 并检查图像 magic。
+
+    放模块顶层是为了 multiprocessing pickle (worker 函数必须可 import).
+    比 verify_aes_key 更紧凑 (省去 try-except 默认通过短路) — 在百万次
+    调用循环里这点开销有意义。
+    """
+    try:
+        decrypted = AES.new(aes_bytes, AES.MODE_ECB).decrypt(ciphertext)
+    except (ValueError, KeyError):
+        return False
+    return any(decrypted.startswith(m) for m in _IMAGE_MAGICS)
+
+
+def _bruteforce_worker_chunk(start, end, xor_key, suffix_bytes, wxid_bytes,
+                              templates, result_queue):
+    """worker: 扫候选区间, 命中 (md5 前缀 + 全模板 AES) 推入 queue 即返回。
+
+    内联做 md5 + AES 验证 (不分两 pass) 让早停在 worker 内有效。
+    suffix 用 binary 比 (digest()[:2] vs hexdigest()[:4]), 节省 hex 转换。
+    """
+    for i in range(start, end):
+        uin = (i << 8) | xor_key
+        uin_bytes = str(uin).encode("ascii")
+        if hashlib.md5(uin_bytes).digest()[:2] == suffix_bytes:
+            aes_hex = hashlib.md5(uin_bytes + wxid_bytes).hexdigest()[:16]
+            aes_bytes = aes_hex.encode("ascii")
+            if all(_aes_template_match(aes_bytes, ct) for ct in templates):
+                result_queue.put((uin, aes_hex))
+                return
+
+
+def _bruteforce_with_aes_parallel(xor_key, suffix_hex, wxid_norm, templates,
+                                   workers=None, timeout=60):
+    """方案2 多进程实现 — 加速思路借鉴自 @H3CoF6 PR #69.
+
+    与单进程版本的差异:
+    - cpu_count 个 worker 并行扫 0~2^32 候选 (~5-8x 加速)
+    - 二进制 md5 digest()[:2] 替代 hexdigest()[:4] (省 hex 转换)
+    - 内联多模板 AES 验证 (无两 pass; PR #69 是单模板, 本实现保留多模板
+      交叉验证防短 magic 偶然命中)
+    - 任一 worker 命中即推 queue, 主进程 terminate 其他 (早停)
+
+    Returns:
+        (uin, aes_key_hex) 或 None (timeout / 全 worker 跑完未命中)
+    """
+    suffix_bytes = bytes.fromhex(suffix_hex)
+    wxid_bytes = wxid_norm.encode("ascii")
+    if workers is None:
+        workers = max(1, multiprocessing.cpu_count())
+    total = 1 << 24
+    chunk = total // workers
+
+    queue = multiprocessing.Queue()
+    procs = []
+    for i in range(workers):
+        start_i = i * chunk
+        end_i = (i + 1) * chunk if i != workers - 1 else total
+        p = multiprocessing.Process(
+            target=_bruteforce_worker_chunk,
+            args=(start_i, end_i, xor_key, suffix_bytes, wxid_bytes,
+                  templates, queue),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+
+    found = None
+    deadline = time.time() + timeout
+    try:
+        while any(p.is_alive() for p in procs) and time.time() < deadline:
+            try:
+                found = queue.get(timeout=0.1)
+                break
+            except _queue.Empty:
+                continue
+        # 所有 worker 死亡后 queue 仍可能有最后入队的数据
+        if not found:
+            try:
+                found = queue.get_nowait()
+            except _queue.Empty:
+                pass
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=1)
+    return found
 
 
 # ---------- Dispatcher + 两条路径 ---------- #
@@ -405,27 +503,35 @@ def _find_via_bruteforce(db_dir, attach_dir, templates):
         print(f"[!] 方案2: xor_key 投票分歧 {votes}/{total}, 取多数 0x{xor_key:02x} "
               f"(可能 attach 不全是 JPG)", flush=True)
 
-    print("[*] 方案2: 枚举 2^24 候选 (预计 5-10 秒)...", flush=True)
-    candidates = bruteforce_uin_candidates(xor_key, suffix)
-    print(f"[+] 方案2: {len(candidates)} 个 uin 候选, 跑 AES 验证", flush=True)
+    workers = max(1, multiprocessing.cpu_count())
+    print(f"[*] 方案2: 多进程枚举 (workers={workers}, 预计 ~1-2 秒)...",
+          flush=True)
 
     # 同时试 wxid_full 和 wxid_norm（normalize_wxid 可能去掉后缀）
     wxid_tries = [wxid_norm]
     if wxid_full != wxid_norm:
         wxid_tries.append(wxid_full)
-    for wxid_try in wxid_tries:
-        for uin in candidates:
-            _, aes_key = derive_image_keys(uin, wxid_try)
-            if verify_aes_key_against_all(aes_key, templates):
-                print()
-                print("[OK] 方案2 (fallback) 验证成功:", flush=True)
-                print(f"    uin      = {uin}", flush=True)
-                print(f"    wxid     = {wxid_try}", flush=True)
-                print(f"    xor_key  = 0x{xor_key:02x}", flush=True)
-                print(f"    aes_key  = {aes_key}", flush=True)
-                return xor_key, aes_key
 
-    print("[!] 方案2: 所有 uin 候选都未通过 AES 验证", flush=True)
+    t0 = time.time()
+    for wxid_try in wxid_tries:
+        result = _bruteforce_with_aes_parallel(
+            xor_key, suffix, wxid_try, templates, workers=workers
+        )
+        if result:
+            uin, aes_key = result
+            elapsed = time.time() - t0
+            print()
+            print(f"[OK] 方案2 (fallback) 验证成功 (耗时 {elapsed:.1f}s):",
+                  flush=True)
+            print(f"    uin      = {uin}", flush=True)
+            print(f"    wxid     = {wxid_try}", flush=True)
+            print(f"    xor_key  = 0x{xor_key:02x}", flush=True)
+            print(f"    aes_key  = {aes_key}", flush=True)
+            return xor_key, aes_key
+
+    elapsed = time.time() - t0
+    print(f"[!] 方案2: 所有 uin 候选都未通过 AES 验证 (耗时 {elapsed:.1f}s)",
+          flush=True)
     return None
 
 
