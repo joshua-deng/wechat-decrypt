@@ -1,39 +1,55 @@
-"""macOS WeChat 4.x 图片 AES key 派生（无需扫描进程内存）。
+"""macOS WeChat 4.x 图片 AES key 派生（无需读运行进程）。
 
-通过 macOS 微信 4.x 在磁盘上的 kvcomm 缓存文件命名约定，派生出 V2 .dat
-图片解密所需的 (xor_key, aes_key)。解决 issue #23：macOS 用户无法用
-C 版扫描器从进程内存提取图片密钥（197K 候选全部失败）。
+通过 macOS 微信 4.x 在磁盘上的命名约定派生出 V2 .dat 图片解密所需的
+(xor_key, aes_key)。解决 issue #23：macOS 用户无法用 C 版扫描器从运行
+进程读取出有效的访问凭据（197K 候选全部失败）。
 
-派生算法
---------
-- 扫 ~/.../app_data/net/kvcomm/key_<code>_*.statistic 文件名
-- 对每个 (code, wxid) 候选：
-    xor_key = code & 0xFF
-    aes_key = MD5(str(code) + cleaned_wxid).hex()[:16]   # ASCII 字符串
+派生算法（共享核心）
+--------------------
+- xor_key = uin & 0xFF
+- aes_key = MD5(str(uin) + cleaned_wxid).hex()[:16]   # ASCII 字符串
 - 用 V2 _t.dat 文件 [0xF:0x1F] 16 字节做模板验证：派生出的 aes_key 把
   密文 AES-128-ECB 解出图像 magic（JPEG / PNG / GIF / WebP / wxgf）即视为命中
 - 为防短 magic 偶然命中，要求多个不同模板都通过验证才视为成功
-- 命中后写回 config.json 的 image_aes_key / image_xor_key 字段，
-  monitor_web.py 启动时自动加载，图片消息显示内联预览
+
+uin 来源（两条路径，dispatcher 自动 fallback）
+----------------------------------------------
+方案1（kvcomm 缓存文件名，主路径）：
+  读 ~/.../app_data/net/kvcomm/key_<uin>_*.statistic 提 uin。
+  优点：~毫秒级；缺点：依赖缓存文件，多账号下可能歧义。
+
+方案2（wxid 后缀候选搜索，fallback 路径）：
+  关键洞察：wxid 目录后 4 位 hex == md5(str(uin))[:4]。
+  流程：从 V2 .dat 末字节投票反推 xor_key (假设 JPG EOI = 0xD9) →
+  枚举 (uin & 0xff == xor_key) 的 2^24 个候选 → md5 前缀匹配
+  得 ~256 个 uin 候选 → AES 模板验证唯一定位。
+  优点：不依赖 kvcomm，多账号无歧义；缺点：~7 秒（单核 2^24 MD5）。
+
+命中后写回 config.json 的 image_aes_key / image_xor_key，monitor_web.py
+启动时自动加载，图片消息显示内联预览。
 
 致谢
 ----
-派生算法源自 @hicccc77 在 issue #23 的评论，参考实现位于
-https://github.com/hicccc77/WeFlow （CC BY-NC-SA 4.0）。本模块是独立的
-Python 实现，未复制其 TypeScript 源码；函数边界与变量命名沿用算法的自然
-结构（regex 模式 / MD5 调用顺序 / magic 字节表等不可避免地相同）。
+- 方案1（kvcomm 派生）算法源自 @hicccc77 在 issue #23 的评论，参考实现
+  位于 https://github.com/hicccc77/WeFlow （CC BY-NC-SA 4.0）。
+- 方案2（wxid 后缀候选搜索）思路源自 @H3CoF6 在 issue #68 的评论，
+  提供了 "wxid 后 4 位 == md5(uin)[:4]" 这一关键结构性洞察。
+
+本模块是独立的 Python 实现，未复制任何上游 TypeScript / C 源码；函数
+边界与变量命名沿用算法的自然结构（regex / MD5 调用顺序 / magic 字节表
+等不可避免地相同）。
 
 用法
 ----
   python find_image_key_macos.py
 """
-import glob
 import hashlib
 import json
 import os
 import platform
 import re
 import sys
+from collections import Counter
 
 from Crypto.Cipher import AES
 
@@ -230,34 +246,198 @@ def verify_aes_key_against_all(aes_key_ascii, templates):
     return all(verify_aes_key(aes_key_ascii, ct) for ct in templates)
 
 
+# ---------- 方案2 (wxid 后缀候选搜索, fallback) ---------- #
+
+# md5 hex 后缀只可能是 [0-9a-f]; 严格匹配避免误吃非 hex 字符的 wxid 后缀
+# (microsoft 改方案 / 异常路径) 后悄悄返回空候选误导用户。
+_WXID_HEX_SUFFIX_RE = re.compile(r"^(.+)_([0-9a-fA-F]{4})$")
+
+
+def extract_wxid_parts(db_dir):
+    """从 db_dir 提取 (wxid_full, wxid_norm, suffix)。
+
+    db_dir 形如 .../xwechat_files/<wxid>_<4hex>/db_storage
+    返回 ('A_Hare_626a', 'A_Hare', '626a') 或 None（不匹配 _<4 hex> 后缀）。
+
+    suffix 是 4 位小写 hex（macOS 路径目录名固定格式 = md5(str(uin))[:4]），
+    用作方案2 中候选搜索的 md5 前缀目标。
+    """
+    wxid_candidates = collect_wxid_candidates(db_dir)
+    if not wxid_candidates:
+        return None
+    wxid_full = wxid_candidates[0]  # raw 总是第一个
+    m = _WXID_HEX_SUFFIX_RE.match(wxid_full)
+    if not m:
+        return None
+    return wxid_full, m.group(1), m.group(2).lower()
+
+
+def derive_xor_key_from_v2_dat(attach_dir, sample=10, min_samples=3):
+    """扫多个 V2 .dat 末字节投票反推 xor_key（假设 JPG EOI = 0xD9）。
+
+    macOS 缩略图 _t.dat 几乎都是 JPG，末字节 = 0xD9 ^ xor_key 反推稳定。
+    投票多数一致才信；分歧大说明假设破灭（不全是 JPG）。
+
+    Args:
+        attach_dir: 微信 attach 目录
+        sample: 扫到 N 个 V2 .dat 即停止（性能上限）
+        min_samples: 至少 N 个样本才视为"投票可信"。低于此返回 None,
+            避免 1-2 个样本时一旦撞到非 JPG 就 lock 错 xor_key。
+    Returns:
+        (xor_key, votes, total) 或 None (样本不足 / 找不到 V2 .dat)。
+        votes < total 时调用方应警告 (假设可能破灭)。
+    """
+    if not attach_dir or not os.path.isdir(attach_dir):
+        return None
+    last_bytes = []
+    for root, _, files in os.walk(attach_dir):
+        for f in files:
+            if not f.endswith(".dat"):
+                continue
+            path = os.path.join(root, f)
+            try:
+                if os.path.getsize(path) < 0x20:
+                    continue
+                with open(path, "rb") as fp:
+                    head = fp.read(6)
+                    if head != V2_MAGIC:
+                        continue
+                    fp.seek(-1, 2)
+                    last = fp.read(1)[0]
+                last_bytes.append(last ^ 0xD9)
+                if len(last_bytes) >= sample:
+                    break
+            except OSError:
+                continue
+        if len(last_bytes) >= sample:
+            break
+    if len(last_bytes) < min_samples:
+        return None
+    top, votes = Counter(last_bytes).most_common(1)[0]
+    return top, votes, len(last_bytes)
+
+
+def bruteforce_uin_candidates(xor_key, wxid_suffix):
+    """枚举 0~2^32 中 (uin & 0xff == xor_key) 且 md5(str(uin))[:4] == suffix 的 uin。
+
+    单核 ~7-8 秒（2^24 = 16M MD5）。期望命中数 ~256（2^24 / 16^4）。
+
+    注意 uin 上限假设为 2^32（4 字节无符号整数）。函数命名沿用密码学
+    候选搜索的 brute-force 术语；中文 prose 用 "枚举 / 候选搜索" 表述。
+    """
+    target = wxid_suffix.lower()
+    out = []
+    for uin in range(xor_key, 2 ** 32, 256):
+        if hashlib.md5(str(uin).encode()).hexdigest()[:4] == target:
+            out.append(uin)
+    return out
+
+
+# ---------- Dispatcher + 两条路径 ---------- #
+
+def _find_via_kvcomm(db_dir, templates):
+    """方案1：从 kvcomm 缓存文件名提 uin 候选。
+
+    要求：~/.../app_data/net/kvcomm/key_<uin>_*.statistic 存在。
+    返回 (xor_key, aes_key) 或 None（kvcomm 缺失 / 无 code / wxid 提不出 /
+    所有组合都验证失败）。
+    """
+    kvcomm_dir = find_existing_kvcomm_dir(db_dir)
+    if not kvcomm_dir:
+        print("[!] 方案1: 找不到 kvcomm 缓存目录，已尝试以下候选:", flush=True)
+        for c in derive_kvcomm_dir_candidates(db_dir):
+            print(f"      {c}", flush=True)
+        return None
+    print(f"[+] 方案1: 使用 kvcomm 目录 {kvcomm_dir}", flush=True)
+
+    codes = collect_kvcomm_codes(kvcomm_dir)
+    if not codes:
+        print("[!] 方案1: kvcomm 目录无 key_*.statistic 文件", flush=True)
+        return None
+    print(f"[+] 方案1: 找到 {len(codes)} 个 uin 候选", flush=True)
+
+    wxid_candidates = collect_wxid_candidates(db_dir)
+    if not wxid_candidates:
+        print("[!] 方案1: 无法从 db_dir 提取 wxid", flush=True)
+        return None
+    print(f"[+] 方案1: wxid 候选 {wxid_candidates}", flush=True)
+
+    # 穷举顺序：wxid 外、uin 内。多账号系统下当前账号的所有 uin 优先尝试。
+    for wxid in wxid_candidates:
+        for code in codes:
+            xor_key, aes_key = derive_image_keys(code, wxid)
+            if verify_aes_key_against_all(aes_key, templates):
+                print()
+                print("[OK] 方案1 验证成功（所有模板均通过）:", flush=True)
+                print(f"    uin      = {code}", flush=True)
+                print(f"    wxid     = {wxid}", flush=True)
+                print(f"    xor_key  = 0x{xor_key:02x}", flush=True)
+                print(f"    aes_key  = {aes_key}", flush=True)
+                return xor_key, aes_key
+
+    print("[!] 方案1: 所有 (wxid × uin) 组合都未通过交叉验证", flush=True)
+    return None
+
+
+def _find_via_bruteforce(db_dir, attach_dir, templates):
+    """方案2 (fallback)：从 wxid 后缀候选搜索 uin（不依赖 kvcomm）。
+
+    流程：wxid 后缀 + V2 .dat 末字节投票反推 xor_key → 枚举 2^24 个 uin
+    候选 → 用 templates 跑 AES 验证唯一定位。
+    """
+    parts = extract_wxid_parts(db_dir)
+    if not parts:
+        print("[!] 方案2: wxid 路径不含 _<4 hex> 后缀，无法应用方案2", flush=True)
+        return None
+    wxid_full, wxid_norm, suffix = parts
+    print(f"[+] 方案2: wxid_full={wxid_full}, suffix={suffix}", flush=True)
+
+    xres = derive_xor_key_from_v2_dat(attach_dir)
+    if not xres:
+        print("[!] 方案2: V2 .dat 样本不足 (需 >= 3 个), 无法投票反推 xor_key",
+              flush=True)
+        return None
+    xor_key, votes, total = xres
+    if votes == total:
+        print(f"[+] 方案2: xor_key=0x{xor_key:02x} ({votes}/{total} 一致, 假设 JPG)",
+              flush=True)
+    else:
+        print(f"[!] 方案2: xor_key 投票分歧 {votes}/{total}, 取多数 0x{xor_key:02x} "
+              f"(可能 attach 不全是 JPG)", flush=True)
+
+    print("[*] 方案2: 枚举 2^24 候选 (预计 5-10 秒)...", flush=True)
+    candidates = bruteforce_uin_candidates(xor_key, suffix)
+    print(f"[+] 方案2: {len(candidates)} 个 uin 候选, 跑 AES 验证", flush=True)
+
+    # 同时试 wxid_full 和 wxid_norm（normalize_wxid 可能去掉后缀）
+    wxid_tries = [wxid_norm]
+    if wxid_full != wxid_norm:
+        wxid_tries.append(wxid_full)
+    for wxid_try in wxid_tries:
+        for uin in candidates:
+            _, aes_key = derive_image_keys(uin, wxid_try)
+            if verify_aes_key_against_all(aes_key, templates):
+                print()
+                print("[OK] 方案2 (fallback) 验证成功:", flush=True)
+                print(f"    uin      = {uin}", flush=True)
+                print(f"    wxid     = {wxid_try}", flush=True)
+                print(f"    xor_key  = 0x{xor_key:02x}", flush=True)
+                print(f"    aes_key  = {aes_key}", flush=True)
+                return xor_key, aes_key
+
+    print("[!] 方案2: 所有 uin 候选都未通过 AES 验证", flush=True)
+    return None
+
+
 def find_image_key_macos(db_dir):
     """在 macOS 上派生并交叉验证 V2 图片密钥。
+
+    Dispatcher：先尝试方案1 (kvcomm)，失败 fallback 到方案2 (候选搜索)。
+    两条路径都需要 V2 .dat 模板做 AES 验证 — 模板缺失就直接失败。
 
     Returns:
         (xor_key, aes_key_ascii) on success；失败返回 None 并打印诊断信息。
     """
-    kvcomm_dir = find_existing_kvcomm_dir(db_dir)
-    if not kvcomm_dir:
-        print(f"[!] 找不到 kvcomm 缓存目录，已尝试以下候选:", flush=True)
-        for c in derive_kvcomm_dir_candidates(db_dir):
-            print(f"      {c}", flush=True)
-        print("    通常意味着微信尚未生成密钥缓存，请先在微信中查看 1-2 张图片",
-              flush=True)
-        return None
-    print(f"[+] 使用 kvcomm 目录: {kvcomm_dir}", flush=True)
-
-    codes = collect_kvcomm_codes(kvcomm_dir)
-    if not codes:
-        print(f"[!] kvcomm 目录无 key_*.statistic 文件: {kvcomm_dir}", flush=True)
-        return None
-    print(f"[+] 找到 {len(codes)} 个 code 候选", flush=True)
-
-    wxid_candidates = collect_wxid_candidates(db_dir)
-    if not wxid_candidates:
-        print(f"[!] 无法从 db_dir 提取 wxid: {db_dir}", flush=True)
-        return None
-    print(f"[+] wxid 候选: {wxid_candidates}", flush=True)
-
     base_dir = os.path.dirname(db_dir)  # 去掉 db_storage
     attach_dir = os.path.join(base_dir, "msg", "attach")
     templates = find_v2_template_ciphertexts(attach_dir)
@@ -268,24 +448,15 @@ def find_image_key_macos(db_dir):
         return None
     print(f"[+] 找到 {len(templates)} 个不同模板用于交叉验证", flush=True)
 
-    # 穷举顺序：wxid 外、code 内。这样多账号系统下当前账号的所有 code 优先尝试。
-    for wxid in wxid_candidates:
-        for code in codes:
-            xor_key, aes_key = derive_image_keys(code, wxid)
-            if verify_aes_key_against_all(aes_key, templates):
-                print()
-                print("[✓] 验证成功（所有模板均通过）:", flush=True)
-                print(f"    code     = {code}", flush=True)
-                print(f"    wxid     = {wxid}", flush=True)
-                print(f"    xor_key  = 0x{xor_key:02x}", flush=True)
-                print(f"    aes_key  = {aes_key}", flush=True)
-                return xor_key, aes_key
+    # 方案1 (主路径): kvcomm 缓存
+    result = _find_via_kvcomm(db_dir, templates)
+    if result is not None:
+        return result
 
+    # 方案2 (fallback): wxid 后缀候选搜索
     print()
-    print("[!] 所有 (wxid × code) 组合都未通过交叉验证", flush=True)
-    print("    可能原因：微信版本变更了派生算法 / 缓存已失效 / 模板文件损坏",
-          flush=True)
-    return None
+    print("[*] 方案1 失败, 尝试方案2 (wxid 后缀候选搜索, fallback)", flush=True)
+    return _find_via_bruteforce(db_dir, attach_dir, templates)
 
 
 def _save_config_atomic(config_path, config):

@@ -22,8 +22,8 @@ class NormalizeWxidTests(unittest.TestCase):
         self.assertEqual(fkm.normalize_wxid("wxid_abc123"), "wxid_abc123")
 
     def test_account_with_4char_alnum_suffix_stripped(self):
-        # macOS 路径常见：your_wxid_a1b2c3 → your_wxid
-        self.assertEqual(fkm.normalize_wxid("your_wxid_a1b2c3"), "your_wxid")
+        # macOS 路径常见：your_wxid_a1b2 → your_wxid
+        self.assertEqual(fkm.normalize_wxid("your_wxid_a1b2"), "your_wxid")
 
     def test_account_without_recognizable_suffix_returned_asis(self):
         self.assertEqual(fkm.normalize_wxid("simple"), "simple")
@@ -52,7 +52,7 @@ class DeriveImageKeysTests(unittest.TestCase):
 
     def test_aes_does_not_normalize_wxid_internally(self):
         # 归一化由调用方负责；不同 wxid 字符串产出不同 key
-        _, aes_full = fkm.derive_image_keys(18709375, "your_wxid_a1b2c3")
+        _, aes_full = fkm.derive_image_keys(18709375, "your_wxid_a1b2")
         _, aes_norm = fkm.derive_image_keys(18709375, "your_wxid")
         self.assertNotEqual(aes_full, aes_norm)
 
@@ -150,9 +150,9 @@ class CollectKvcommCodesTests(unittest.TestCase):
 
 class CollectWxidCandidatesTests(unittest.TestCase):
     def test_returns_raw_and_normalized_when_different(self):
-        db_dir = "/x/Documents/xwechat_files/your_wxid_a1b2c3/db_storage"
+        db_dir = "/x/Documents/xwechat_files/your_wxid_a1b2/db_storage"
         self.assertEqual(fkm.collect_wxid_candidates(db_dir),
-                         ["your_wxid_a1b2c3", "your_wxid"])
+                         ["your_wxid_a1b2", "your_wxid"])
 
     def test_returns_one_when_normalize_is_identity(self):
         db_dir = "/x/Documents/xwechat_files/wxid_abc/db_storage"
@@ -322,7 +322,7 @@ class FindImageKeyMacosIntegrationTests(unittest.TestCase):
     def test_full_flow_succeeds_with_normalized_wxid(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_dir, xor_exp, aes_exp = self._build_test_env(
-                tmp, code=18709375, wxid_raw="your_wxid_a1b2c3", num_templates=3)
+                tmp, code=18709375, wxid_raw="your_wxid_a1b2", num_templates=3)
             result = fkm.find_image_key_macos(db_dir)
             self.assertIsNotNone(result, "派生应该成功")
             self.assertEqual(result, (xor_exp, aes_exp))
@@ -454,6 +454,206 @@ class MainShortCircuitTests(unittest.TestCase):
                 cfg_after = json.load(f)
             self.assertEqual(cfg_after["image_aes_key"], aes_exp)
             self.assertEqual(cfg_after["image_xor_key"], xor_exp)
+
+
+# ---------- 方案2 (wxid 后缀候选搜索, fallback) 单元测试 ---------- #
+
+class ExtractWxidPartsTests(unittest.TestCase):
+    """extract_wxid_parts: 从 db_dir 提 (full, norm, suffix)。"""
+
+    def test_extracts_norm_and_suffix_from_alnum_suffix(self):
+        db_dir = "/foo/Documents/xwechat_files/your_wxid_626a/db_storage"
+        self.assertEqual(
+            fkm.extract_wxid_parts(db_dir),
+            ("your_wxid_626a", "your_wxid", "626a"),
+        )
+
+    def test_wxid_format_with_4char_suffix(self):
+        db_dir = "/foo/Documents/xwechat_files/wxid_abc_e2f4/db_storage"
+        self.assertEqual(
+            fkm.extract_wxid_parts(db_dir),
+            ("wxid_abc_e2f4", "wxid_abc", "e2f4"),
+        )
+
+    def test_uppercase_suffix_lowercased(self):
+        db_dir = "/foo/Documents/xwechat_files/your_wxid_ABCD/db_storage"
+        result = fkm.extract_wxid_parts(db_dir)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[2], "abcd")
+
+    def test_no_4char_suffix_returns_none(self):
+        # 6字符尾缀不匹配 _<4字符>$, 算法假设破灭
+        db_dir = "/foo/Documents/xwechat_files/wxid_simple/db_storage"
+        self.assertIsNone(fkm.extract_wxid_parts(db_dir))
+
+    def test_no_xwechat_files_returns_none(self):
+        self.assertIsNone(fkm.extract_wxid_parts("/random/path/db_storage"))
+
+
+class DeriveXorKeyFromV2DatTests(unittest.TestCase):
+    """derive_xor_key_from_v2_dat: 末字节投票反推 xor_key。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_v2_dat(self, name, last_byte, subdir=""):
+        d = os.path.join(self.dir, subdir) if subdir else self.dir
+        os.makedirs(d, exist_ok=True)
+        body = (fkm.V2_MAGIC + b"\x00" * 9 + b"\x11" * 16
+                + b"\x00" * 4 + bytes([last_byte]))
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(body)
+
+    def test_unanimous_vote(self):
+        # 全部末字节 = 0xA6 → xor_key = 0xA6 ^ 0xD9 = 0x7F
+        for i in range(10):
+            self._write_v2_dat(f"x{i}_t.dat", 0xA6)
+        self.assertEqual(fkm.derive_xor_key_from_v2_dat(self.dir),
+                         (0x7F, 10, 10))
+
+    def test_majority_vote_with_dissent(self):
+        # 8 个 0xA6, 2 个 0x55: 多数 0x7F 胜出
+        for i in range(8):
+            self._write_v2_dat(f"good{i}_t.dat", 0xA6)
+        for i in range(2):
+            self._write_v2_dat(f"bad{i}_t.dat", 0x55)
+        result = fkm.derive_xor_key_from_v2_dat(self.dir)
+        self.assertEqual(result, (0x7F, 8, 10))
+
+    def test_no_v2_dat_returns_none(self):
+        self.assertIsNone(fkm.derive_xor_key_from_v2_dat(self.dir))
+
+    def test_below_min_samples_returns_none(self):
+        # 默认 min_samples=3, 仅有 2 个样本应被视为不可信
+        for i in range(2):
+            self._write_v2_dat(f"x{i}_t.dat", 0xA6)
+        self.assertIsNone(fkm.derive_xor_key_from_v2_dat(self.dir))
+
+    def test_missing_dir_returns_none(self):
+        self.assertIsNone(fkm.derive_xor_key_from_v2_dat("/nonexistent"))
+
+    def test_walks_into_subdirs(self):
+        for i in range(10):
+            self._write_v2_dat(f"x{i}_t.dat", 0xA6, subdir=f"deep/sub{i}")
+        result = fkm.derive_xor_key_from_v2_dat(self.dir)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], 0x7F)
+
+    def test_skips_non_v2_files(self):
+        # 不是 V2 magic 的 .dat 不计入投票
+        with open(os.path.join(self.dir, "junk.dat"), "wb") as f:
+            f.write(b"NOT_V2" + b"\x00" * 30)
+        for i in range(10):
+            self._write_v2_dat(f"x{i}_t.dat", 0xA6)
+        result = fkm.derive_xor_key_from_v2_dat(self.dir)
+        self.assertEqual(result, (0x7F, 10, 10))
+
+
+class BruteforceUinCandidatesTests(unittest.TestCase):
+    """bruteforce_uin_candidates: 候选枚举 + md5 前缀匹配。
+
+    注意：test_real_bruteforce_against_golden 单核 ~7-8 秒，全套测试耗时大头。
+    """
+
+    def test_real_bruteforce_against_golden(self):
+        # 真跑全空间 2^24 候选, 同时验证: (a) 真 uin 在结果里
+        # (b) 候选数合理 (~256) (c) 候选都满足 xor_key 约束
+        # md5("18709375")[:4] == "626a", 18709375 & 0xff == 0x7F
+        out = fkm.bruteforce_uin_candidates(0x7F, "626a")
+        self.assertIn(18709375, out, "真 uin 应在候选里")
+        self.assertTrue(200 <= len(out) <= 350,
+                        f"候选数 {len(out)} 偏离 ~256 (理论 2^24/2^16)")
+        for uin in out[:20]:
+            self.assertEqual(uin & 0xFF, 0x7F,
+                             f"uin {uin} 不满足 xor_key 约束")
+
+
+
+class FindViaBruteforceTests(unittest.TestCase):
+    """方案2 端到端 (mock bruteforce 加速)。"""
+
+    def _build_bruteforce_env(self, tmp, uin, wxid_norm, suffix):
+        wxid_full = f"{wxid_norm}_{suffix}"
+        base = os.path.join(tmp, "Documents", "xwechat_files", wxid_full)
+        db_dir = os.path.join(base, "db_storage")
+        attach_dir = os.path.join(base, "msg", "attach")
+        os.makedirs(db_dir)
+        os.makedirs(attach_dir)
+        xor_exp, aes_exp = fkm.derive_image_keys(uin, wxid_norm)
+        last_byte = 0xD9 ^ xor_exp
+        jpeg_pt = b"\xff\xd8\xff\xe0" + b"\x00" * 12
+        ct = AES.new(aes_exp.encode("ascii"), AES.MODE_ECB).encrypt(jpeg_pt)
+        # 构造 10 个 V2 dat 让 derive_xor_key 投票稳定
+        for i in range(10):
+            with open(os.path.join(attach_dir, f"img{i}_t.dat"), "wb") as f:
+                f.write(fkm.V2_MAGIC + b"\x00" * 9 + ct
+                        + b"\x00" * 4 + bytes([last_byte]))
+        return db_dir, attach_dir, xor_exp, aes_exp
+
+    def test_full_flow_with_mocked_bruteforce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_dir, attach_dir, xor_exp, aes_exp = self._build_bruteforce_env(
+                tmp, uin=18709375, wxid_norm="your_wxid", suffix="626a")
+            templates = fkm.find_v2_template_ciphertexts(attach_dir)
+            with patch.object(fkm, "bruteforce_uin_candidates",
+                              return_value=[18709375]):
+                result = fkm._find_via_bruteforce(db_dir, attach_dir, templates)
+            self.assertEqual(result, (xor_exp, aes_exp))
+
+    def test_returns_none_when_no_wxid_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Documents", "xwechat_files", "wxid_nosuffix")
+            db_dir = os.path.join(base, "db_storage")
+            attach_dir = os.path.join(base, "msg", "attach")
+            os.makedirs(db_dir)
+            os.makedirs(attach_dir)
+            self.assertIsNone(fkm._find_via_bruteforce(db_dir, attach_dir, []))
+
+    def test_returns_none_when_no_v2_dat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Documents", "xwechat_files",
+                                "your_wxid_626a")
+            db_dir = os.path.join(base, "db_storage")
+            attach_dir = os.path.join(base, "msg", "attach")
+            os.makedirs(db_dir)
+            os.makedirs(attach_dir)
+            self.assertIsNone(fkm._find_via_bruteforce(db_dir, attach_dir, []))
+
+
+class DispatcherFallbackTests(unittest.TestCase):
+    """find_image_key_macos dispatcher: 方案1 失败 → fallback 方案2。"""
+
+    def test_kvcomm_missing_falls_back_to_bruteforce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            uin, wxid_norm, suffix = 18709375, "your_wxid", "626a"
+            wxid_full = f"{wxid_norm}_{suffix}"
+            base = os.path.join(tmp, "Documents", "xwechat_files", wxid_full)
+            db_dir = os.path.join(base, "db_storage")
+            attach_dir = os.path.join(base, "msg", "attach")
+            os.makedirs(db_dir)
+            os.makedirs(attach_dir)
+
+            # 不创建 kvcomm → 方案1 失败
+            xor_exp, aes_exp = fkm.derive_image_keys(uin, wxid_norm)
+            last_byte = 0xD9 ^ xor_exp
+            jpeg_pt = b"\xff\xd8\xff\xe0" + b"\x00" * 12
+            ct = AES.new(aes_exp.encode("ascii"), AES.MODE_ECB).encrypt(jpeg_pt)
+            for i in range(10):
+                with open(os.path.join(attach_dir, f"img{i}_t.dat"), "wb") as f:
+                    f.write(fkm.V2_MAGIC + b"\x00" * 9 + ct
+                            + b"\x00" * 4 + bytes([last_byte]))
+
+            # patch HOME 让兜底 kvcomm 路径也找不到
+            # mock bruteforce 加速 (只返回真 uin)
+            with patch("os.path.expanduser", return_value=tmp), \
+                 patch.object(fkm, "bruteforce_uin_candidates",
+                              return_value=[uin]):
+                result = fkm.find_image_key_macos(db_dir)
+            self.assertEqual(result, (xor_exp, aes_exp))
 
 
 class SaveConfigAtomicTests(unittest.TestCase):
