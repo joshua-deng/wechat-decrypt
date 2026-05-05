@@ -8,10 +8,7 @@ import hashlib
 import multiprocessing
 import time
 from config import load_config
-try:
-    from Crypto.Cipher import AES
-except ImportError:
-    AES = None
+from Crypto.Cipher import AES
 
 
 def find_v2_ciphertext(attach_dir):
@@ -25,7 +22,7 @@ def find_v2_ciphertext(attach_dir):
                 header = fp.read(31)
             if header[:6] == v2_magic and len(header) >= 31:
                 return header[15:31], os.path.basename(f)
-        except:
+        except Exception:
             continue
     return None, None
 
@@ -46,7 +43,7 @@ def find_xor_key(attach_dir):
             if head == v2_magic and len(tail) == 2:
                 key = (tail[0], tail[1])
                 tail_counts[key] = tail_counts.get(key, 0) + 1
-        except:
+        except Exception:
             continue
 
     if not tail_counts:
@@ -57,12 +54,10 @@ def find_xor_key(attach_dir):
     xor_key = x ^ 0xFF
     if (y ^ 0xD9) == xor_key:
         return xor_key
-    return xor_key
+    return None
 
 
 def try_key(key_bytes, ciphertext):
-    if not AES:
-        return None
     try:
         cipher = AES.new(key_bytes, AES.MODE_ECB)
         dec = cipher.decrypt(ciphertext)
@@ -71,7 +66,7 @@ def try_key(key_bytes, ciphertext):
         if dec[:4] == b'RIFF': return 'WEBP'
         if dec[:4] == b'wxgf': return 'WXGF'
         if dec[:3] == b'GIF': return 'GIF'
-    except:
+    except Exception:
         pass
     return None
 
@@ -94,10 +89,6 @@ def find_image_key_offline(cfg):
     print("\n" + "=" * 60)
     print("  尝试提取图片 AES 密钥")
     print("=" * 60)
-
-    if not AES:
-        print("[!] 缺少 pycryptodome 库，无法进行 AES 解密验证，跳过图片密钥提取。")
-        return
 
     db_dir = cfg.get("db_dir", "")
     if not db_dir:
@@ -123,12 +114,14 @@ def find_image_key_offline(cfg):
     xor_key = find_xor_key(attach_dir)
     if xor_key is None:
         print("[!] 找不到足够的 _t.dat 文件推导 XOR key，跳过爆破")
+        print("    请先在微信中查看 2-3 张图片，让缩略图缓存到本地后再重试。")
         return
     print(f"[*] 找到 XOR key: 0x{xor_key:02x}")
-    
+
     ciphertext, ct_file = find_v2_ciphertext(attach_dir)
     if not ciphertext:
         print("[!] 找不到 V2 加密的图片文件，跳过爆破")
+        print("    请先在微信中查看 2-3 张图片，让缩略图缓存到本地后再重试。")
         return
         
     print(f"[*] 启动多进程 UIN 空间爆破...")
@@ -161,8 +154,11 @@ def find_image_key_offline(cfg):
                 break
             time.sleep(0.1)
     finally:
-        for p in processes: p.terminate()
-            
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join(timeout=1)
+
     elapsed = time.time() - t0
     if found:
         print(f"[+] 爆破成功! UIN={found[0]}, 耗时={elapsed:.1f}s")
