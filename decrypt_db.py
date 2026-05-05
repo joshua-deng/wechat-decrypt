@@ -140,13 +140,14 @@ def main():
 
     success = 0
     failed = 0
+    skipped = 0
     total_bytes = 0
 
     for rel, path, sz in db_files:
         key_info = get_key_info(keys, rel)
         if not key_info:
             print(f"SKIP: {rel} (无密钥)")
-            failed += 1
+            skipped += 1
             continue
 
         enc_key = bytes.fromhex(key_info["enc_key"])
@@ -176,7 +177,7 @@ def main():
             failed += 1
 
     print(f"\n{'='*60}")
-    print(f"结果: {success} 成功, {failed} 失败, 共 {len(db_files)} 个")
+    print(f"结果: {success} 成功, {failed} 失败, {skipped} 跳过(无密钥), 共 {len(db_files)} 个")
     print(f"解密数据量: {total_bytes/1024/1024/1024:.1f}GB")
     print(f"解密文件在: {OUT_DIR}")
 
