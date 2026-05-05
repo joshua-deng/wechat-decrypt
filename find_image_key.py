@@ -337,7 +337,7 @@ def main():
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
-    db_dir = config['db_dir']
+    db_dir = os.path.expanduser(os.path.expandvars(config['db_dir']))
     base_dir = os.path.dirname(db_dir)
     attach_dir = os.path.join(base_dir, 'msg', 'attach')
 

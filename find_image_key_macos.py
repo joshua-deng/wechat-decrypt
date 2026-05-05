@@ -607,6 +607,7 @@ def main(config_path=None):
     if not db_dir:
         print("[!] config.json 中未配置 db_dir", file=sys.stderr, flush=True)
         sys.exit(1)
+    db_dir = os.path.expanduser(os.path.expandvars(db_dir))
     print(f"[*] db_dir = {db_dir}", flush=True)
 
     # 短路：如果已有 image_aes_key 且仍能在所有模板上验证通过，直接退出
