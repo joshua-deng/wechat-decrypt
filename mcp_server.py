@@ -707,6 +707,9 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
     if app_type == 19:
         return _format_record_message_text(appmsg, title)
 
+    if app_type == 2000:
+        return _format_transfer_message_text(appmsg, title)
+
     if app_type == 6:
         return f"[文件] {title}" if title else "[文件]"
     if app_type == 5:
@@ -818,6 +821,80 @@ def _format_record_message_text(appmsg, title):
         lines.append(f"  …（还有 {len(items) - _RECORD_MAX_ITEMS} 条未显示）")
 
     return "\n".join(lines)
+
+
+# 微信转账 (appmsg type=2000, <wcpayinfo>) paysubtype 含义。
+# 微信官方无公开文档，此表来自社区抓包归纳。1/3/4 在所有已知版本一致；
+# 5/7/8 在不同版本存在变体（"过期已退还"在某些抓包里也归为 4），所以遇到
+# 未识别值时降级显示原始数字，方便用户自行核对。
+_TRANSFER_PAYSUBTYPE_LABEL = {
+    '1': '发起转账',     # 发送方记录：等待对方收钱
+    '3': '已收款',       # 双向：发送方看到"对方已收"，接收方看到"已收钱"
+    '4': '已退还',       # 主动退还或被退还
+    '5': '过期已退还',    # 24h 未收，自动退还（发送方记录）
+    '7': '待领取',       # 已发起未接收
+    '8': '已领取',       # 部分版本：转账被领取（接收方记录）
+}
+
+
+def _extract_transfer_info(appmsg):
+    """从 appmsg type=2000 解出 wcpayinfo 各字段，返回 dict 或 None。
+
+    字段大小写在不同微信版本间漂移（见过 feedesc/feeDesc, pay_memo/paymemo），
+    用 lower-case 兜底。所有值用 _collapse_text 清掉换行/前后空白。
+    """
+    info = appmsg.find('wcpayinfo')
+    if info is None:
+        return None
+
+    def _pick(*tags):
+        for t in tags:
+            v = _collapse_text(info.findtext(t) or '')
+            if v:
+                return v
+        return ''
+
+    paysubtype = _pick('paysubtype')
+    return {
+        'paysubtype': paysubtype,
+        'paysubtype_label': _TRANSFER_PAYSUBTYPE_LABEL.get(
+            paysubtype, f'未知(paysubtype={paysubtype})' if paysubtype else ''
+        ),
+        # feedesc 通常是 "¥0.01" 风格的展示串；feedescxml 是富文本变体
+        'fee_desc': _pick('feedesc', 'feeDesc'),
+        'pay_memo': _pick('pay_memo', 'paymemo'),
+        # 三种交易号：transcationid 是微信支付侧（注意拼写是 transc 不是 trans），
+        # transferid 是微信内部转账 id，paymsgid 偶见于旧版本
+        'transcation_id': _pick('transcationid', 'transcationId'),
+        'transfer_id': _pick('transferid', 'transferId'),
+        'pay_msg_id': _pick('paymsgid', 'payMsgId'),
+        'begin_transfer_time': _pick('begintransfertime', 'beginTransferTime'),
+        'invalid_time': _pick('invalidtime', 'invalidTime'),
+        'effective_date': _pick('effectivedate', 'effectiveDate'),
+        'payer_username': _pick('payer_username', 'payerUsername'),
+        'receiver_username': _pick('receiver_username', 'receiverUsername'),
+    }
+
+
+def _format_transfer_message_text(appmsg, title):
+    """渲染微信转账（appmsg type=2000）一行展示文本，给 history / monitor_web 共用。
+
+    fallback 顺序：
+      1) wcpayinfo 缺失 → 只显示 title 兜底，避免吞数据
+      2) paysubtype 未知 → 显示原始数字让用户自查
+      3) 没有 fee_desc → 至少给个方向标签
+    """
+    info = _extract_transfer_info(appmsg)
+    if not info:
+        return f"[转账] {title}" if title else "[转账]"
+
+    label = info['paysubtype_label'] or '转账'
+    parts = [f"[转账·{label}]"] if label != '转账' else ["[转账]"]
+    if info['fee_desc']:
+        parts.append(info['fee_desc'])
+    if info['pay_memo']:
+        parts.append(f"备注: {info['pay_memo']}")
+    return ' '.join(parts)
 
 
 def _format_voip_message_text(content):
@@ -2477,6 +2554,149 @@ def decode_record_item(chat_name: str, local_id: int, item_index: int, create_ti
         f"  类型: [{type_label}] {datatitle or '(无标题)'}\n"
         f"  {binding_note}"
     )
+
+
+@mcp.tool()
+def decode_transfer(chat_name: str, local_id: int, create_time: int = 0) -> str:
+    """读取微信转账消息（appmsg type=2000）的结构化信息。
+
+    返回方向（发起/收款/退还）、金额、备注、付款人/收款人 wxid、交易号、
+    发起/失效时间。1v1 与群聊（指定成员转账）均适用。
+
+    使用流程：先用 get_chat_history 找到 [转账·xxx] 行 (local_id=N, ts=T)，
+    把 N 和 T 一起传进来。create_time(ts) 用于跨分片场景下唯一定位。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或wxid
+        local_id: 转账消息的 local_id（从 get_chat_history 获取）
+        create_time: 消息的 unix 时间戳，从 get_chat_history 输出 ts=N 部分获取。
+            用于在 local_id 跨分片冲突时唯一定位；传 0 时若多个分片含同 local_id 会报歧义错误
+    """
+    try:
+        local_id = int(local_id)
+        create_time = int(create_time)
+    except (TypeError, ValueError):
+        return "错误: local_id 和 create_time 必须是整数"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    # 多分片扫描 + ambiguity 检测，跟 decode_file_message 一致
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
+        return f"找不到 {chat_name} 的消息表"
+
+    matches = []
+    for shard in shards:
+        if not _is_safe_msg_table_name(shard['table_name']):
+            continue
+        with closing(sqlite3.connect(shard['db_path'])) as conn:
+            if create_time:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=? AND create_time=?",
+                    (local_id, create_time)
+                ).fetchone()
+            else:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=?",
+                    (local_id,)
+                ).fetchone()
+        if candidate_row:
+            matches.append((shard['db_path'], candidate_row))
+
+    if not matches:
+        if create_time:
+            return f"找不到 (local_id={local_id}, create_time={create_time}) 的消息（已扫描 {len(shards)} 个分片）"
+        return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
+    if len(matches) > 1:
+        details = []
+        for db_p, r in matches:
+            ct = r[1]
+            ts_str = datetime.fromtimestamp(ct).isoformat() if ct else '?'
+            details.append(f"{os.path.basename(db_p)} create_time={ct} ({ts_str})")
+        return (
+            f"local_id={local_id} 在 {len(matches)} 个分片中都存在，无法唯一定位:\n  "
+            + '\n  '.join(details)
+            + f"\n请加 create_time 参数：decode_transfer(chat_name, local_id={local_id}, create_time=N)"
+        )
+
+    _, row = matches[0]
+    local_type, msg_create_time, content, ct_compress = row
+    base_type, _ = _split_msg_type(local_type)
+    if base_type != 49:
+        return (
+            f"不是转账消息（local_type={local_type}, base_type={base_type}），"
+            f"转账消息应为 base_type=49 + appmsg type=2000"
+        )
+
+    xml_text = _decompress_content(content, ct_compress)
+    if not xml_text:
+        return "消息 content 为空或无法解码"
+
+    is_group = username.endswith('@chatroom')
+    _, xml_text = _parse_message_content(xml_text, local_type, is_group)
+
+    root = _parse_app_message_outer(xml_text)
+    if root is None:
+        return "无法解析消息 XML"
+    appmsg = root.find('.//appmsg')
+    if appmsg is None:
+        return "消息中没有 appmsg 段（不像转账）"
+
+    app_type = _parse_int(_collapse_text(appmsg.findtext('type') or ''), 0)
+    if app_type != 2000:
+        return (
+            f"不是转账消息（appmsg type={app_type}）。"
+            f"转账要求 appmsg type=2000；type=6 是文件，type=19 是合并转发，"
+            f"请用对应的 decode_file_message / decode_record_item 工具"
+        )
+
+    info = _extract_transfer_info(appmsg)
+    if info is None:
+        return "消息是 type=2000 但缺 <wcpayinfo> 节点（schema 异常）"
+
+    def _fmt_ts(ts_str):
+        ts = _parse_int(ts_str, 0)
+        if not ts:
+            return ''
+        try:
+            return datetime.fromtimestamp(ts).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return f'(无效 ts={ts_str})'
+
+    direction = info['paysubtype_label'] or '(未知)'
+    raw_paysubtype = info['paysubtype'] or '?'
+    title = _collapse_text(appmsg.findtext('title') or '') or '微信转账'
+    des = _collapse_text(appmsg.findtext('des') or '')
+
+    lines = [f"转账消息: {title}"]
+    if des:
+        lines.append(f"  描述: {des}")
+    lines.append(f"  方向: {direction} (paysubtype={raw_paysubtype})")
+    if info['fee_desc']:
+        lines.append(f"  金额: {info['fee_desc']}")
+    if info['pay_memo']:
+        lines.append(f"  备注: {info['pay_memo']}")
+    if info['payer_username']:
+        lines.append(f"  付款方 wxid: {info['payer_username']}")
+    if info['receiver_username']:
+        lines.append(f"  收款方 wxid: {info['receiver_username']}")
+    begin_ts = _fmt_ts(info['begin_transfer_time'])
+    if begin_ts:
+        lines.append(f"  发起时间: {begin_ts}")
+    invalid_ts = _fmt_ts(info['invalid_time'])
+    if invalid_ts:
+        lines.append(f"  失效时间: {invalid_ts}")
+    if info['transfer_id']:
+        lines.append(f"  转账 ID: {info['transfer_id']}")
+    if info['transcation_id']:
+        lines.append(f"  支付交易号: {info['transcation_id']}")
+    if info['pay_msg_id']:
+        lines.append(f"  paymsgid: {info['pay_msg_id']}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
