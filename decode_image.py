@@ -319,17 +319,36 @@ class ImageResolver:
         self.aes_key = aes_key
         self.xor_key = xor_key
 
-    def get_image_md5(self, local_id):
-        """通过 local_id 查 message_resource.db 获取图片文件 MD5"""
+    def get_image_md5(self, username, local_id):
+        """通过 (username, local_id) 查 message_resource.db 获取图片 MD5
+
+        message_local_id 在 MessageResourceInfo 中跨 chat 重复 (不全局唯一),
+        必须用 chat_id 缩小范围;同一 chat 内活跃聊天也会复用 local_id
+        (实测最高同 chat 7 条同 local_id 的记录), 默认取最新一条。
+
+        message_local_type 上 32 bit 是版本/会话 flag, 用 % 2^32 取低位匹配
+        图片类型 3, 同 monitor_web.py 里 push 路径的写法。
+        """
         path = self.cache.get("message/message_resource.db")
         if not path:
             return None
 
         conn = sqlite3.connect(path)
         try:
+            chat_row = conn.execute(
+                "SELECT rowid FROM ChatName2Id WHERE user_name = ?",
+                (username,)
+            ).fetchone()
+            if not chat_row:
+                return None
+            chat_id = chat_row[0]
+
             row = conn.execute(
-                "SELECT packed_info FROM MessageResourceInfo WHERE local_id = ?",
-                (local_id,)
+                "SELECT packed_info FROM MessageResourceInfo "
+                "WHERE chat_id = ? AND message_local_id = ? "
+                "AND (message_local_type = 3 OR message_local_type % 4294967296 = 3) "
+                "ORDER BY message_create_time DESC LIMIT 1",
+                (chat_id, local_id)
             ).fetchone()
             if row and row[0]:
                 return extract_md5_from_packed_info(row[0])
@@ -365,10 +384,10 @@ class ImageResolver:
         Returns:
             dict with keys: success, path, format, md5, error
         """
-        # 1. 获取 MD5
-        file_md5 = self.get_image_md5(local_id)
+        # 1. 获取 MD5 (chat-scoped: 同 local_id 跨 chat 重复)
+        file_md5 = self.get_image_md5(username, local_id)
         if not file_md5:
-            return {'success': False, 'error': f'无法从 message_resource.db 找到 local_id={local_id} 的图片信息'}
+            return {'success': False, 'error': f'无法从 message_resource.db 找到 {username} local_id={local_id} 的图片信息'}
 
         # 2. 找 .dat 文件
         dat_files = self.find_dat_files(username, file_md5)
@@ -432,7 +451,7 @@ class ImageResolver:
 
         results = []
         for local_id, create_time in rows:
-            file_md5 = self.get_image_md5(local_id)
+            file_md5 = self.get_image_md5(username, local_id)
             info = {
                 'local_id': local_id,
                 'create_time': create_time,

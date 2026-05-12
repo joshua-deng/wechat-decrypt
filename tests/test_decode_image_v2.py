@@ -70,23 +70,68 @@ class _FakeCache:
         return self._mapping.get(rel_key)
 
 
-def _make_resource_db(path, local_id, file_md5):
-    """构造最小 message_resource.db,只含一条 packed_info 记录。
+def _make_resource_db(path, local_id, file_md5, username="wxid_test123",
+                       chat_id=1, message_create_time=1700000000,
+                       message_local_type=3, extra_rows=()):
+    """构造最小 message_resource.db, 表 schema 对齐真实微信结构。
+
+    真实表里 message_local_id 不全局唯一 (跨 chat 重复, 活跃 chat 内也会复用),
+    解析必须用 ChatName2Id.rowid -> chat_id 限定 + message_local_type=3 过滤图片。
 
     packed_info 里嵌入 extract_md5_from_packed_info 期望的 protobuf marker
     (\\x12\\x22\\x0a\\x20) 加 32 字节 ASCII hex MD5。
+
+    Args:
+        extra_rows: 额外 (chat_id, message_local_id, message_local_type,
+                    message_create_time, file_md5) 元组列表, 用于构造同 local_id
+                    跨 chat / 同 chat 多版本的歧义场景。
     """
     marker = b'\x12\x22\x0a\x20'
-    packed = b'\x00' * 8 + marker + file_md5.encode('ascii') + b'\x00' * 4
+    def _packed(md5_hex):
+        return b'\x00' * 8 + marker + md5_hex.encode('ascii') + b'\x00' * 4
+
     conn = sqlite3.connect(path)
     try:
+        conn.execute("""
+            CREATE TABLE MessageResourceInfo (
+                message_id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
+                sender_id INTEGER,
+                message_local_type INTEGER,
+                message_create_time INTEGER,
+                message_local_id INTEGER,
+                message_svr_id INTEGER,
+                message_origin_source INTEGER,
+                packed_info BLOB
+            )
+        """)
         conn.execute(
-            "CREATE TABLE MessageResourceInfo (local_id INTEGER PRIMARY KEY, packed_info BLOB)"
+            "CREATE TABLE ChatName2Id (user_name TEXT PRIMARY KEY, update_time INTEGER)"
         )
         conn.execute(
-            "INSERT INTO MessageResourceInfo VALUES (?, ?)",
-            (local_id, packed),
+            "INSERT INTO ChatName2Id (rowid, user_name, update_time) VALUES (?, ?, ?)",
+            (chat_id, username, message_create_time),
         )
+        next_msg_id = 1
+        conn.execute(
+            "INSERT INTO MessageResourceInfo "
+            "(message_id, chat_id, sender_id, message_local_type, message_create_time, "
+            " message_local_id, message_svr_id, message_origin_source, packed_info) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (next_msg_id, chat_id, 0, message_local_type, message_create_time,
+             local_id, 0, 0, _packed(file_md5)),
+        )
+        next_msg_id += 1
+        for extra in extra_rows:
+            ex_chat_id, ex_local_id, ex_type, ex_ctime, ex_md5 = extra
+            conn.execute(
+                "INSERT INTO MessageResourceInfo "
+                "(message_id, chat_id, sender_id, message_local_type, message_create_time, "
+                " message_local_id, message_svr_id, message_origin_source, packed_info) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (next_msg_id, ex_chat_id, 0, ex_type, ex_ctime, ex_local_id, 0, 0, _packed(ex_md5)),
+            )
+            next_msg_id += 1
         conn.commit()
     finally:
         conn.close()
@@ -258,6 +303,81 @@ class TestImageResolverV2(unittest.TestCase):
         result = resolver.decode_image(self.username, self.local_id)
         self.assertTrue(result['success'], msg=result)
         self.assertEqual(result['format'], 'png')
+
+    def test_decode_image_disambiguates_local_id_across_chats(self):
+        """同 local_id 跨 chat 重复时, 必须按 username -> chat_id 选对; 否则会拿到
+        别的 chat 的 MD5 (或视频 type=43 的 packed_info), 解出错图。
+
+        生产 DB 上同一个 message_local_id 实测会出现在 5+ 个不同 chat 里,
+        其中混有图片 (type=3) / 视频 (type=43) / 群聊 / 私聊, 必须 chat-scoped
+        + type 过滤才能定位。
+        """
+        os.unlink(self.db_path)
+        other_md5 = "f" * 32
+        video_md5 = "a" * 32
+        _make_resource_db(
+            self.db_path, self.local_id, self.file_md5,
+            username=self.username, chat_id=7,
+            message_create_time=1778487726,
+            extra_rows=[
+                # 另一个 chat 同 local_id 同图片类型, MD5 不同 —— 选错就拿这个
+                (5, self.local_id, 3, 1700000000, other_md5),
+                # 又一个 chat 同 local_id 但是视频 (type=43), 应被 type 过滤
+                (132, self.local_id, 43, 1750000000, video_md5),
+            ],
+        )
+        # 给冲突 chat 也注册 user_name, 否则 chat-scope 等价
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO ChatName2Id (rowid, user_name, update_time) VALUES (5, ?, 0), (132, ?, 0)",
+            ("other_chat_wxid", "video_chat_wxid"),
+        )
+        conn.commit()
+        conn.close()
+
+        resolver = ImageResolver(
+            self.wechat_base, self.out_dir, self.cache,
+            aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY,
+        )
+        result = resolver.decode_image(self.username, self.local_id)
+        self.assertTrue(result['success'], msg=result)
+        # 必须拿目标 chat 的 MD5, 不是 other_chat 也不是视频
+        self.assertEqual(result['md5'], self.file_md5)
+
+    def test_decode_image_picks_latest_when_same_chat_local_id_reused(self):
+        """活跃 chat 里 local_id 会被复用 (实测同 chat 同 local_id 最多 7 条);
+        默认应返回 message_create_time 最新的那张, 对应用户最近一次 reference。
+        """
+        os.unlink(self.db_path)
+        old_md5 = "c" * 32
+        # self.file_md5 / self.local_id 在 _make_resource_db 默认插入为 "latest" 那条
+        _make_resource_db(
+            self.db_path, self.local_id, self.file_md5,
+            username=self.username, chat_id=1,
+            message_create_time=1778487726,
+            extra_rows=[
+                # 同 chat 同 local_id 但更早, 不应该被选中
+                (1, self.local_id, 3, 1700000000, old_md5),
+            ],
+        )
+
+        resolver = ImageResolver(
+            self.wechat_base, self.out_dir, self.cache,
+            aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY,
+        )
+        result = resolver.decode_image(self.username, self.local_id)
+        self.assertTrue(result['success'], msg=result)
+        self.assertEqual(result['md5'], self.file_md5)
+
+    def test_decode_image_unknown_chat_returns_error(self):
+        """username 在 ChatName2Id 里找不到时, 应返回结构化错误而不是 crash 或乱选 row。"""
+        resolver = ImageResolver(
+            self.wechat_base, self.out_dir, self.cache,
+            aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY,
+        )
+        result = resolver.decode_image("wxid_does_not_exist", self.local_id)
+        self.assertFalse(result['success'])
+        self.assertIn('wxid_does_not_exist', result['error'])
 
     def test_decode_image_v1_no_aes_key_uses_fixed_key(self):
         # V1 magic 不会被 is_v2_format guard 拦截 (V1 magic 是 \x07\x08V1, V2 是 \x07\x08V2);
