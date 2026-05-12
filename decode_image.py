@@ -189,6 +189,22 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     # wxgf (HEVC 裸流) 格式
     if decrypted[:4] == b'wxgf':
         fmt = 'hevc'
+    elif fmt == 'bin':
+        # detect_image_format 返回 'bin' = magic 不匹配任何已知图片格式,
+        # 通常说明 AES key 错(解密后产生随机字节)。拒绝写出无意义的 .bin
+        # 垃圾文件,让 caller 知道解密失败。
+        return None, None
+    elif xor_size >= 2:
+        # XOR key 错时 AES/raw 段可能产生合法 magic(看似正常 jpg/png 头),
+        # 但 XOR 段乱码。用尾部 magic 验证 XOR key 正确性:
+        # - JPG 必须以 FF D9 (EOI marker) 收尾
+        # - PNG 末尾 12 字节必须含 IEND chunk
+        # 其他格式 (gif/bmp/tif/webp/hevc) 缺乏强制 trailer signature,
+        # 不做校验以避免误杀。xor_size < 2 时无 XOR 段或样本过小,跳过。
+        if fmt == 'jpg' and decrypted[-2:] != b'\xff\xd9':
+            return None, None
+        if fmt == 'png' and b'IEND' not in decrypted[-12:]:
+            return None, None
 
     if out_path is None:
         base = os.path.splitext(dat_path)[0]

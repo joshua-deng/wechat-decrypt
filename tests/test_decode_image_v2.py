@@ -195,6 +195,82 @@ class TestV2DecryptSynthetic(unittest.TestCase):
             self.assertEqual(fmt, 'hevc')
             self.assertTrue(out_path.endswith('.hevc'))
 
+    def test_v2_rejects_wrong_aes_key(self):
+        # AES key 错时 detect_image_format 返回 'bin' (magic 不识别),v2_decrypt_file
+        # 应拒绝写出 .bin 垃圾文件并返回 (None, None),让 caller 知道解密失败。
+        with tempfile.TemporaryDirectory() as td:
+            dat_path = os.path.join(td, "test.dat")
+            with open(dat_path, 'wb') as f:
+                f.write(_build_v2_dat(TEST_PNG_PAYLOAD, aes_size=32, xor_size=16))
+
+            wrong_aes_key = b'wrongkey00000000'
+            out_path, fmt = v2_decrypt_file(
+                dat_path, aes_key=wrong_aes_key, xor_key=TEST_XOR_KEY,
+            )
+            self.assertIsNone(out_path)
+            self.assertIsNone(fmt)
+
+    def test_v2_rejects_wrong_xor_key_jpg_trailer(self):
+        # JPG 必须以 FF D9 (EOI) 收尾。XOR key 错时尾部 16 字节乱码,
+        # FF D9 被破坏,触发尾部 magic 校验失败。
+        jpg_payload = b'\xff\xd8\xff' + b'\x00' * 83 + b'\xff\xd9'  # 88 bytes, FF D9 在末尾
+        with tempfile.TemporaryDirectory() as td:
+            dat_path = os.path.join(td, "test.dat")
+            with open(dat_path, 'wb') as f:
+                f.write(_build_v2_dat(jpg_payload, aes_size=32, xor_size=16))
+
+            # 翻转所有 XOR 字节: TEST_XOR_KEY ^ 0xff 保证每字节都错位
+            out_path, fmt = v2_decrypt_file(
+                dat_path, aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY ^ 0xff,
+            )
+            self.assertIsNone(out_path)
+            self.assertIsNone(fmt)
+
+    def test_v2_rejects_wrong_xor_key_png_iend(self):
+        # PNG 末尾 12 字节必须含 IEND chunk。XOR key 错时 IEND 被破坏。
+        with tempfile.TemporaryDirectory() as td:
+            dat_path = os.path.join(td, "test.dat")
+            with open(dat_path, 'wb') as f:
+                f.write(_build_v2_dat(TEST_PNG_PAYLOAD, aes_size=32, xor_size=16))
+
+            out_path, fmt = v2_decrypt_file(
+                dat_path, aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY ^ 0xff,
+            )
+            self.assertIsNone(out_path)
+            self.assertIsNone(fmt)
+
+    def test_v2_skip_xor_validation_when_xor_size_zero(self):
+        # xor_size < 2 时没有 XOR 段(或样本不足以验证),不应触发尾部 magic 校验。
+        # 构造 xor_size=0 的 PNG (整张图都在 AES + raw 段),xor_key 实际不参与解密。
+        with tempfile.TemporaryDirectory() as td:
+            dat_path = os.path.join(td, "test.dat")
+            with open(dat_path, 'wb') as f:
+                f.write(_build_v2_dat(TEST_PNG_PAYLOAD, aes_size=32, xor_size=0))
+
+            # xor_key 传 0 也应成功 (XOR 段长度 0)
+            out_path, fmt = v2_decrypt_file(
+                dat_path, aes_key=TEST_AES_KEY, xor_key=0x00,
+            )
+            self.assertIsNotNone(out_path)
+            self.assertEqual(fmt, 'png')
+
+    def test_v2_wxgf_skips_trailer_validation(self):
+        # wxgf (HEVC 裸流) 没有强制 trailer signature,XOR key 错时也不应被尾部校验误杀
+        # (wxgf 路径在 elif 链前面命中,直接 fmt='hevc',不进入 XOR 校验分支)。
+        # 这里验证:即便 XOR key 错导致末尾字节乱码,只要 wxgf magic 在头部正确,
+        # 仍按 hevc 输出 — 因为我们只校验 jpg/png,其他格式跳过。
+        wxgf_payload = b'wxgf' + b'\x00' * 84
+        with tempfile.TemporaryDirectory() as td:
+            dat_path = os.path.join(td, "test.dat")
+            with open(dat_path, 'wb') as f:
+                f.write(_build_v2_dat(wxgf_payload, aes_size=32, xor_size=16))
+
+            out_path, fmt = v2_decrypt_file(
+                dat_path, aes_key=TEST_AES_KEY, xor_key=TEST_XOR_KEY ^ 0xff,
+            )
+            self.assertIsNotNone(out_path)
+            self.assertEqual(fmt, 'hevc')
+
 
 class TestImageResolverV2(unittest.TestCase):
     """ImageResolver 端到端:从 local_id 到解密文件,验证 V2 keys 注入路径"""
@@ -270,7 +346,12 @@ class TestImageResolverV2(unittest.TestCase):
                 aes_key=v1_fixed_key, magic=V1_MAGIC_FULL,
             ))
 
-        resolver = ImageResolver(self.wechat_base, self.out_dir, self.cache, aes_key=None)
+        # xor_key 必须跟 _build_v2_dat 加密时用的一致,否则 XOR 段乱码,
+        # 触发新的尾部 magic 校验失败 (PNG IEND chunk 错位)。
+        resolver = ImageResolver(
+            self.wechat_base, self.out_dir, self.cache,
+            aes_key=None, xor_key=TEST_XOR_KEY,
+        )
         result = resolver.decode_image(self.username, self.local_id)
         self.assertTrue(result['success'], msg=result)
         self.assertEqual(result['format'], 'png')
