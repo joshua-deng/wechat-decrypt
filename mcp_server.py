@@ -666,6 +666,31 @@ def _parse_app_message_outer(content):
     return root
 
 
+def _format_namecard_text(content):
+    """Parse type=42 (名片) XML into a compact human-readable line.
+
+    Source XML carries dozens of fields (antispamticket, biznamecardinfo,
+    brand URLs, image MD5s) but the useful signal is just three attrs:
+    ``nickname`` (display name), ``username`` (wxid; ``gh_*`` for 公众号),
+    and ``certinfo`` (the user-authored bio). Everything else is either
+    auth tokens that should not be piped to downstream systems, or
+    rendering metadata that bloats the chat log without helping a human
+    or an LLM understand the conversation.
+    """
+    root = _parse_xml_root(content)
+    if root is None:
+        return None
+    nickname = (root.get("nickname") or "").strip()
+    username = (root.get("username") or "").strip()
+    certinfo = _collapse_text(root.get("certinfo") or "")
+    if not nickname and not username:
+        return None
+    head = nickname or username
+    if username.startswith("gh_"):
+        head = f"{head} (公众号 {username})"
+    return f"[名片] {head}: {certinfo}" if certinfo else f"[名片] {head}"
+
+
 def _format_app_message_text(content, local_type, is_group, chat_username, chat_display_name, names):
     if not content or '<appmsg' not in content:
         return None
@@ -865,6 +890,8 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
         text = "[表情]"
     elif base_type == 50:
         text = _format_voip_message_text(text) or "[通话]"
+    elif base_type == 42:
+        text = _format_namecard_text(text) or "[名片]"
     elif base_type == 49:
         formatted = _format_app_message_text(
             text, local_type, is_group, chat_username, chat_display_name, names
