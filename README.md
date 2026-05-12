@@ -221,9 +221,22 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
 
 - 成本：约 $0.006 / 分钟（OpenAI 计价）
 - 文件 > 25MB 在上传前被拒绝（OpenAI 上限）
-- 首次启用云后端时 stderr 会打一行警告
-- `transcription_backend` 或 `openai_api_key` 任一缺失时静默回退 local
-- 切换后端后，旧缓存条目（backend 不匹配）会自动重新转录
+
+如需切换到 whisper.cpp 后端（macOS Metal GPU 加速，3-5x 更快），在 `config.json` 中：
+
+```json
+{
+    "transcription_backend": "whisper_cpp"
+}
+```
+
+数据全程留在本机，不上传。需要 `brew install whisper-cpp` 并下载模型（自动检测常见路径，或通过 `whisper_cpp_binary` / `whisper_cpp_model` 指定）。
+
+所有后端共用以下行为：
+- 首次启用 openai 或 whisper_cpp 后端时 stderr 会打一行警告
+- openai: `openai_api_key` 缺失时静默回退 local
+- whisper_cpp: 二进制文件未找到时静默回退 local
+- 切换后端后，旧缓存条目（backend 不匹配）自动重新转录
 
 **[查看使用案例 →](USAGE.md)**
 
