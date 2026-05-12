@@ -162,11 +162,47 @@ def _auto_detect_db_dir_linux():
     return _choose_candidate(candidates)
 
 
+def _auto_detect_db_dir_macos():
+    """自动检测 macOS 微信 db_storage 路径。
+
+    微信 4.x 数据目录位于 ~/Library/Containers/com.tencent.xinWeChat/.../xwechat_files/<wxid>/db_storage，
+    路径中包含随机 hash，需要搜索定位。
+    """
+    base = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+    )
+    if not os.path.isdir(base):
+        return None
+
+    seen = set()
+    candidates = []
+    pattern = os.path.join(base, "*", "db_storage")
+    for match in glob.glob(pattern):
+        normalized = os.path.normcase(os.path.normpath(match))
+        if os.path.isdir(match) and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(match)
+
+    # 优先使用最近活跃账号：按 message 目录 mtime 降序
+    def _mtime(path):
+        msg_dir = os.path.join(path, "message")
+        target = msg_dir if os.path.isdir(msg_dir) else path
+        try:
+            return os.path.getmtime(target)
+        except OSError:
+            return 0
+
+    candidates.sort(key=_mtime, reverse=True)
+    return _choose_candidate(candidates)
+
+
 def auto_detect_db_dir():
     if _SYSTEM == "windows":
         return _auto_detect_db_dir_windows()
     if _SYSTEM == "linux":
         return _auto_detect_db_dir_linux()
+    if _SYSTEM == "darwin":
+        return _auto_detect_db_dir_macos()
     return None
 
 
@@ -197,6 +233,8 @@ def load_config():
             print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
             if _SYSTEM == "linux":
                 print("    Linux 默认路径类似: ~/Documents/xwechat_files/<wxid>/db_storage")
+            elif _SYSTEM == "darwin":
+                print("    macOS 默认路径类似: ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid>/db_storage")
             else:
                 print(f"    路径可在 微信设置 → 文件管理 中找到")
             sys.exit(1)
