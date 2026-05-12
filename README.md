@@ -50,9 +50,9 @@ macOS：
 - macOS 10.15+（Apple Silicon / Intel 均可）
 - 微信 4.x（macOS 版）
 - Xcode Command Line Tools：`xcode-select --install`
-- 需要对 `/Applications/WeChat.app` 做 ad-hoc 重签名（允许进程内存读取）
+- 需要对 `/Applications/WeChat.app` 做 ad-hoc 重签名（允许进程内存读取），重签名前须先退出微信
 - 需要 root 权限运行扫描器
-- `db_dir` 默认类似 `~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/<hash>/Message`
+- `db_dir` 默认类似 `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid>/db_storage`
 
 ### 安装依赖
 
@@ -60,13 +60,43 @@ macOS：
 pip install -r requirements.txt
 ```
 
-Windows 如果遇到权限不足或全局环境不可写，可以改用：
+<details>
+<summary>⚠️ 安装失败？点击展开常见问题</summary>
+
+**问题：`error: externally-managed-environment` (PEP 668)**
+
+Homebrew Python (3.12+) 和部分 Linux 发行版禁止 `pip install` 直接写入系统 Python 环境，会报此错误。
+
+**解决：使用虚拟环境**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # 激活虚拟环境
+pip install -r requirements.txt
+
+# 后续运行脚本时使用 .venv 中的 Python
+.venv/bin/python3 main.py
+.venv/bin/python3 decrypt_db.py
+```
+
+或使用 Makefile（已配置 `.venv/bin/python3`）：
+
+```bash
+make decrypt  # 等价于 .venv/bin/python3 main.py decrypt
+make web      # 等价于 .venv/bin/python3 main.py
+```
+
+---
+
+**Windows 权限不足或全局环境不可写**，可以改用：
 
 ```bash
 py -m pip install --user -r requirements.txt
 ```
 
 如果需要读取受保护的进程或把依赖安装到系统 Python，也可能需要以管理员身份打开终端。
+
+</details>
 
 ### 快速开始
 
@@ -86,10 +116,11 @@ python3 main.py decrypt
 macOS（密钥扫描用 C 版本，见下文 [macOS 数据库密钥扫描](#macos-数据库密钥扫描-wechat-4x) 章节）：
 
 ```bash
-# 1. 重新签名（首次及微信升级后各一次）
+# 1. 退出微信，重新签名（首次及微信升级后各一次）
+killall WeChat
 sudo codesign --force --deep --sign - /Applications/WeChat.app
 
-# 2. 编译并运行扫描器
+# 2. 重新打开微信并登录，然后编译并运行扫描器
 cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
 sudo ./find_all_keys_macos
 
@@ -124,14 +155,14 @@ macOS 版 `config.json` 示例：
 
 ```json
 {
-    "db_dir": "/Users/yourname/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/<hash>/Message",
+    "db_dir": "/Users/yourname/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/your_wxid/db_storage",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
     "wechat_process": "WeChat"
 }
 ```
 
-`db_dir` 路径：Windows 可在微信设置 → 文件管理中找到；Linux 默认在 `~/Documents/xwechat_files/<wxid>/db_storage`；macOS 在 `~/Library/Containers/com.tencent.xinWeChat/.../Message`（`<hash>` 是微信随机生成的账号目录）。
+`db_dir` 路径：Windows 可在微信设置 → 文件管理中找到；Linux 默认在 `~/Documents/xwechat_files/<wxid>/db_storage`；macOS 在 `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid>/db_storage`（程序已支持自动检测）。
 
 ### Web UI 说明
 
@@ -349,6 +380,54 @@ sudo ./find_all_keys_macos <pid>
 ```bash
 python3 decrypt_db.py
 ```
+
+### 常见问题
+
+#### `task_for_pid failed: 5`
+
+以 root 运行扫描器后仍报此错，说明微信进程的 Hardened Runtime 签名未移除。
+
+**原因**：macOS 会阻止对带有 Hardened Runtime 标志的进程进行内存读取，即使以 root 身份运行也不行。微信默认签名包含此标志。
+
+**排查步骤**：
+
+```bash
+# 1. 检查微信当前签名（如包含 flags=0x10000(runtime) 则需要重签名）
+codesign -dvvv /Applications/WeChat.app 2>&1 | grep flags
+
+# 2. 必须先退出微信再重签名（微信在运行时重签名不会生效）
+killall WeChat
+sudo codesign --force --deep --sign - /Applications/WeChat.app
+
+# 3. 验证签名已变更（应显示 flags=0x2，不再有 runtime 标志）
+codesign -dvvv /Applications/WeChat.app 2>&1 | grep flags
+
+# 4. 重新打开微信并登录，然后运行扫描器
+sudo ./find_all_keys_macos
+```
+
+**注意**：
+- 微信每次更新后签名会恢复原始状态，需重新执行上述步骤
+- `--deep` 参数确保签名覆盖 App Bundle 内所有嵌套二进制文件
+- 重签名后必须重启微信，否则进程仍使用旧的签名凭证
+
+#### 未能自动检测微信数据目录
+
+程序已支持 macOS 自动检测微信数据目录。如果检测失败，手动查找并配置：
+
+```bash
+# 搜索 db_storage 目录
+find ~/Library/Containers/com.tencent.xinWeChat -type d -name "db_storage" 2>/dev/null
+```
+
+如有多个账号（多个 `db_storage` 目录），按修改时间判断当前活跃账号：
+
+```bash
+stat -f "%m %N" /path/to/account1/db_storage /path/to/account2/db_storage
+# 数值更大 = 最近活跃
+```
+
+然后编辑 `config.json`，将找到的路径填入 `db_dir` 字段。
 
 ## 免责声明
 
