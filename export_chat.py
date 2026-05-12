@@ -85,7 +85,9 @@ def export_chat(chat_name, output_path):
         local_id, local_type, create_time, real_sender_id, content, ct = row
         sender = _resolve_sender(row, ctx, names, id_to_username)
         type_str = _msg_type_str(local_type)
-        rendered = _extract_content(local_id, local_type, content, ct, username, display_name)
+        rendered, extras = _extract_content(
+            local_id, local_type, content, ct, username, display_name
+        )
 
         # Compact format: omit defaults/nulls. type defaults to "text", transcription
         # is added later by transcribe_chat.py only for voice messages. See CLAUDE.md.
@@ -94,10 +96,18 @@ def export_chat(chat_name, output_path):
             "timestamp": create_time,
             "sender": sender,
         }
-        if type_str != "text":
-            msg["type"] = type_str
+        # extras may override type with a more specific value (e.g. "transfer"
+        # narrower than the generic "link_or_file" base=49 maps to).
+        effective_type = (extras or {}).get("type") or type_str
+        if effective_type != "text":
+            msg["type"] = effective_type
         if rendered is not None:
             msg["content"] = rendered
+        if extras:
+            for k, v in extras.items():
+                if k == "type":
+                    continue
+                msg[k] = v
         messages.append(msg)
 
     output = {

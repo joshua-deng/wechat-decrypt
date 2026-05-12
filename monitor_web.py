@@ -1317,6 +1317,29 @@ class SessionMonitor:
                         'des': des[:200] if des else '',
                         'items': items,
                     }
+                elif app_type == 2000:
+                    # 微信转账 — paysubtype 含义为社区共识表，1/3/4 跨版本一致；
+                    # 字段名在不同版本有 snake/camel 漂移，逐个尝试
+                    info = appmsg.find('wcpayinfo')
+                    paysubtype = ''
+                    fee_desc = ''
+                    pay_memo = ''
+                    if info is not None:
+                        paysubtype = (info.findtext('paysubtype') or '').strip()
+                        fee_desc = (info.findtext('feedesc') or info.findtext('feeDesc') or '').strip()
+                        pay_memo = (info.findtext('pay_memo') or info.findtext('paymemo') or '').strip()
+                    direction = {
+                        '1': '发起转账', '3': '已收款', '4': '已退还',
+                        '5': '过期已退还', '7': '待领取', '8': '已领取',
+                    }.get(paysubtype, '')
+                    return {
+                        'type': 'transfer',
+                        'title': title or '微信转账',
+                        'direction': direction,
+                        'paysubtype': paysubtype,
+                        'fee_desc': fee_desc,
+                        'pay_memo': pay_memo[:200] if pay_memo else '',
+                    }
                 else:
                     # 其他子类型: 用 title 显示
                     if title:
@@ -1657,6 +1680,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .chatlog-item{font-size:12px;color:#999;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .chatlog-item b{color:#bbb;font-weight:500}
 .chatlog-more{font-size:11px;color:#555;margin-top:4px}
+.msg-transfer{display:inline-block;background:rgba(255,170,60,.1);border:1px solid rgba(255,170,60,.25);border-radius:8px;padding:8px 14px;margin-top:4px;min-width:180px}
+.msg-transfer-head{font-size:13px;color:#ffb84d;font-weight:500}
+.msg-transfer-amount{font-size:18px;color:#ffd28a;font-weight:600;margin-top:4px}
+.msg-transfer-memo{font-size:11px;color:#999;margin-top:4px}
 a.msg-link{text-decoration:none;color:inherit}
 #lightbox{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:1000;cursor:zoom-out;justify-content:center;align-items:center}
 #lightbox.show{display:flex}
@@ -1771,6 +1798,12 @@ function renderRich(r){
       body = '<div class="msg-link-des">'+esc(r.des)+'</div>';
     }
     return `<div class="msg-chatlog"><div class="msg-link-title">📋 ${esc(r.title)}</div>${body}</div>`;
+  }
+  if(r.type==='transfer') {
+    let dirLabel = r.direction || '微信转账';
+    let amount = r.fee_desc ? '<div class="msg-transfer-amount">'+esc(r.fee_desc)+'</div>' : '';
+    let memo = r.pay_memo ? '<div class="msg-transfer-memo">备注: '+esc(r.pay_memo)+'</div>' : '';
+    return `<div class="msg-transfer"><div class="msg-transfer-head">💸 ${esc(dirLabel)}</div>${amount}${memo}</div>`;
   }
   if(r.type==='voice') return `<div class="msg-voice">🎤 语音 ${r.duration}s</div>`;
   if(r.type==='video') return `<div class="msg-video">🎬 视频${r.duration?' '+r.duration+'s':''}</div>`;

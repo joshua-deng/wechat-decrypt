@@ -309,5 +309,162 @@ class FormatRecordMessageTextTests(unittest.TestCase):
             mcp_server._RECORD_MAX_ITEMS = original_max
 
 
+# -------- WCPay transfer (appmsg type=2000) --------------------------------
+#
+# All fixtures use synthetic placeholder values — no real wxid / fee / id /
+# memo. paysubtype semantics are community consensus from open-source wechat
+# tooling; treat any "未识别" branch as forward-compatible degradation.
+
+
+class TransferPaysubTypeLabelTests(unittest.TestCase):
+    def test_known_subtypes_present(self):
+        labels = mcp_server._TRANSFER_PAYSUBTYPE_LABEL
+        self.assertEqual(labels['1'], '发起转账')
+        self.assertEqual(labels['3'], '已收款')
+        self.assertEqual(labels['4'], '已退还')
+        # 5/7/8 are version-dependent variants — locked to current text so a
+        # silent rename in mcp_server.py would surface here.
+        self.assertEqual(labels['5'], '过期已退还')
+        self.assertEqual(labels['7'], '待领取')
+        self.assertEqual(labels['8'], '已领取')
+
+
+def _transfer_appmsg(
+    paysubtype='1',
+    fee_desc='¥100.00',
+    pay_memo='',
+    payer='wxid_payer_synth',
+    receiver='wxid_recv_synth',
+    transferid='1' + '0' * 27,
+    transcationid='1' + '0' * 27,
+    begin_ts='1746528000',
+    invalid_ts='1746614400',
+    title='微信转账',
+    des='请收钱',
+    feedesc_tag='feedesc',
+    paymemo_tag='pay_memo',
+):
+    """Build a synthetic appmsg type=2000 root element. All values are
+    placeholder; tests never run against real wechat data."""
+    import xml.etree.ElementTree as ET
+    fee_node = f'<{feedesc_tag}>{fee_desc}</{feedesc_tag}>' if fee_desc else ''
+    memo_node = f'<{paymemo_tag}>{pay_memo}</{paymemo_tag}>' if pay_memo else ''
+    xml_text = (
+        f'<msg><appmsg><title>{title}</title><des>{des}</des>'
+        f'<type>2000</type>'
+        f'<wcpayinfo>'
+        f'<paysubtype>{paysubtype}</paysubtype>'
+        f'{fee_node}{memo_node}'
+        f'<transferid>{transferid}</transferid>'
+        f'<transcationid>{transcationid}</transcationid>'
+        f'<begintransfertime>{begin_ts}</begintransfertime>'
+        f'<invalidtime>{invalid_ts}</invalidtime>'
+        f'<payer_username>{payer}</payer_username>'
+        f'<receiver_username>{receiver}</receiver_username>'
+        f'</wcpayinfo></appmsg></msg>'
+    )
+    return ET.fromstring(xml_text), xml_text
+
+
+class ExtractTransferInfoTests(unittest.TestCase):
+    def test_full_fields_round_trip(self):
+        root, _ = _transfer_appmsg(paysubtype='3', pay_memo='lunch split')
+        appmsg = root.find('.//appmsg')
+        info = mcp_server._extract_transfer_info(appmsg)
+        self.assertIsNotNone(info)
+        self.assertEqual(info['paysubtype'], '3')
+        self.assertEqual(info['paysubtype_label'], '已收款')
+        self.assertEqual(info['fee_desc'], '¥100.00')
+        self.assertEqual(info['pay_memo'], 'lunch split')
+        self.assertEqual(info['payer_username'], 'wxid_payer_synth')
+        self.assertEqual(info['receiver_username'], 'wxid_recv_synth')
+        self.assertEqual(info['begin_transfer_time'], '1746528000')
+        self.assertEqual(info['invalid_time'], '1746614400')
+        self.assertTrue(info['transfer_id'].startswith('1'))
+        self.assertTrue(info['transcation_id'].startswith('1'))
+
+    def test_missing_wcpayinfo_returns_none(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(
+            '<msg><appmsg><title>x</title><type>2000</type></appmsg></msg>'
+        )
+        appmsg = root.find('.//appmsg')
+        self.assertIsNone(mcp_server._extract_transfer_info(appmsg))
+
+    def test_camelcase_feedesc_falls_back(self):
+        # 部分微信版本字段名为 feeDesc 而非 feedesc
+        root, _ = _transfer_appmsg(feedesc_tag='feeDesc')
+        appmsg = root.find('.//appmsg')
+        info = mcp_server._extract_transfer_info(appmsg)
+        self.assertEqual(info['fee_desc'], '¥100.00')
+
+    def test_camelcase_paymemo_falls_back(self):
+        # paymemo (无下划线) 也是已知变体
+        root, _ = _transfer_appmsg(pay_memo='note', paymemo_tag='paymemo')
+        appmsg = root.find('.//appmsg')
+        info = mcp_server._extract_transfer_info(appmsg)
+        self.assertEqual(info['pay_memo'], 'note')
+
+    def test_unknown_paysubtype_label_degraded(self):
+        root, _ = _transfer_appmsg(paysubtype='99')
+        appmsg = root.find('.//appmsg')
+        info = mcp_server._extract_transfer_info(appmsg)
+        self.assertEqual(info['paysubtype'], '99')
+        self.assertIn('99', info['paysubtype_label'])
+
+    def test_empty_paysubtype_label_empty(self):
+        root, _ = _transfer_appmsg(paysubtype='')
+        appmsg = root.find('.//appmsg')
+        info = mcp_server._extract_transfer_info(appmsg)
+        self.assertEqual(info['paysubtype_label'], '')
+
+
+class FormatTransferMessageTextTests(unittest.TestCase):
+    def test_initiate_with_amount(self):
+        root, _ = _transfer_appmsg(paysubtype='1')
+        appmsg = root.find('.//appmsg')
+        out = mcp_server._format_transfer_message_text(appmsg, '微信转账')
+        self.assertIn('[转账·发起转账]', out)
+        self.assertIn('¥100.00', out)
+
+    def test_received_with_memo(self):
+        root, _ = _transfer_appmsg(paysubtype='3', pay_memo='lunch')
+        appmsg = root.find('.//appmsg')
+        out = mcp_server._format_transfer_message_text(appmsg, '微信转账')
+        self.assertIn('[转账·已收款]', out)
+        self.assertIn('备注: lunch', out)
+
+    def test_missing_wcpayinfo_falls_back_to_title(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(
+            '<msg><appmsg><title>微信转账</title><type>2000</type></appmsg></msg>'
+        )
+        appmsg = root.find('.//appmsg')
+        out = mcp_server._format_transfer_message_text(appmsg, '微信转账')
+        self.assertEqual(out, '[转账] 微信转账')
+
+    def test_missing_fee_desc_safe(self):
+        # 没有金额时也要给一行能看的输出，不能崩
+        root, _ = _transfer_appmsg(paysubtype='4', fee_desc='')
+        appmsg = root.find('.//appmsg')
+        out = mcp_server._format_transfer_message_text(appmsg, '微信转账')
+        self.assertIn('[转账·已退还]', out)
+
+
+class AppMessageDispatchTransferTests(unittest.TestCase):
+    """type=2000 must route through _format_transfer_message_text via
+    _format_app_message_text (so get_chat_history / export_chat both pick it up)."""
+
+    def test_dispatch_calls_transfer_helper(self):
+        _, xml_text = _transfer_appmsg(paysubtype='3', pay_memo='dinner')
+        out = mcp_server._format_app_message_text(
+            xml_text, 49, False, 'wxid_dummy', 'dummy', {}
+        )
+        self.assertIsNotNone(out)
+        self.assertIn('[转账·已收款]', out)
+        self.assertIn('¥100.00', out)
+        self.assertIn('备注: dinner', out)
+
+
 if __name__ == '__main__':
     unittest.main()

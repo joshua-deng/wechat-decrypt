@@ -113,26 +113,78 @@ def _format_video_message(content):
     return f"[视频] {playlength}秒" if playlength else "[视频]"
 
 
+def _extract_transfer_extras(content):
+    """Detect appmsg type=2000 and return structured transfer fields, else None.
+
+    Reuses mcp_server._extract_transfer_info so the schema/version-quirks logic
+    lives in one place. Empty values are dropped to keep the export compact.
+    Numeric timestamps are returned as ints (consistent with the top-level
+    `timestamp` field), not iso strings — downstream consumers can format.
+    """
+    if not content or '<appmsg' not in content:
+        return None
+    root = mcp_server._parse_app_message_outer(content)
+    if root is None:
+        return None
+    appmsg = root.find('.//appmsg')
+    if appmsg is None:
+        return None
+    app_type = mcp_server._parse_int(
+        mcp_server._collapse_text(appmsg.findtext('type') or ''), 0
+    )
+    if app_type != 2000:
+        return None
+
+    info = mcp_server._extract_transfer_info(appmsg)
+    if not info:
+        return None
+
+    out = {}
+    if info['paysubtype_label']:
+        out['direction'] = info['paysubtype_label']
+    for k in ('paysubtype', 'fee_desc', 'pay_memo',
+              'payer_username', 'receiver_username',
+              'transfer_id', 'transcation_id', 'pay_msg_id'):
+        v = info.get(k)
+        if v:
+            out[k] = v
+    for k in ('begin_transfer_time', 'invalid_time'):
+        v = mcp_server._parse_int(info.get(k) or '', 0)
+        if v:
+            out[k] = v
+    return out or None
+
+
 def _extract_content(local_id, local_type, content, ct, chat_username, chat_display_name):
+    """Return (rendered_text, extras_dict). Either may be None.
+
+    extras carries structured fields for non-text message types where caller
+    wants more than the human-readable string (currently: transfer). Future
+    additions (video号 metadata, merged-forward expansion, …) can flow through
+    the same channel without changing the caller signature.
+    """
     content = mcp_server._decompress_content(content, ct)
     if content is None:
-        return None
+        return None, None
 
     base, _ = mcp_server._split_msg_type(local_type)
     if base == 1:
-        return content or ""
+        return (content or ""), None
     if base == 43:
-        return _format_video_message(content)
+        return _format_video_message(content), None
     if base == 47:
-        return _format_sticker_message(content)
+        return _format_sticker_message(content), None
     if base == 49:
-        return mcp_server._format_app_message_text(
+        rendered = mcp_server._format_app_message_text(
             content, local_type, False, chat_username, chat_display_name, {}
         )
+        transfer = _extract_transfer_extras(content)
+        extras = {'type': 'transfer', 'transfer': transfer} if transfer else None
+        return rendered, extras
     if base == 50:
-        return mcp_server._format_voip_message_text(content)
+        return mcp_server._format_voip_message_text(content), None
     if base == 10000:
-        return _format_system_message(content)
+        return _format_system_message(content), None
     if base == 10002:
-        return "[撤回消息]"
-    return None
+        return "[撤回消息]", None
+    return None, None

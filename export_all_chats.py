@@ -62,13 +62,21 @@ def export_one(username, output_dir, names):
         local_id, local_type, create_time, real_sender_id, content, ct = row
         sender = _resolve_sender(row, ctx, names, id_to_username)
         type_str = _msg_type_str(local_type)
-        rendered = _extract_content(local_id, local_type, content, ct, username, display_name)
+        rendered, extras = _extract_content(
+            local_id, local_type, content, ct, username, display_name
+        )
 
         msg = {"local_id": local_id, "timestamp": create_time, "sender": sender}
-        if type_str != "text":
-            msg["type"] = type_str
+        effective_type = (extras or {}).get("type") or type_str
+        if effective_type != "text":
+            msg["type"] = effective_type
         if rendered is not None:
             msg["content"] = rendered
+        if extras:
+            for k, v in extras.items():
+                if k == "type":
+                    continue
+                msg[k] = v
         messages.append(msg)
 
     if not messages:
