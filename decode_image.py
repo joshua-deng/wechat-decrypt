@@ -333,7 +333,7 @@ class ImageResolver:
         if not path:
             return None
 
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             chat_row = conn.execute(
                 "SELECT rowid FROM ChatName2Id WHERE user_name = ?",
@@ -352,8 +352,9 @@ class ImageResolver:
             ).fetchone()
             if row and row[0]:
                 return extract_md5_from_packed_info(row[0])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[get_image_md5] {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
         finally:
             conn.close()
 
