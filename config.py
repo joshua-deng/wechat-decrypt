@@ -17,7 +17,9 @@ if _SYSTEM == "linux":
     _DEFAULT_PROCESS = "wechat"
 elif _SYSTEM == "darwin":
     # macOS 使用独立的 C 扫描器 (find_all_keys_macos.c)，此处仅提供 config 默认值
-    _DEFAULT_TEMPLATE_DIR = os.path.expanduser("~/Documents/xwechat_files/your_wxid/db_storage")
+    _DEFAULT_TEMPLATE_DIR = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/your_wxid/db_storage"
+    )
     _DEFAULT_PROCESS = "WeChat"
 else:
     _DEFAULT_TEMPLATE_DIR = r"D:\xwechat_files\your_wxid\db_storage"
