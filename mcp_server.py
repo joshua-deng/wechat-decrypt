@@ -6,7 +6,7 @@ Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
 import io
-import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re, threading
+import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit, re, threading, subprocess
 import glob
 import wave
 import hmac as hmac_mod
@@ -2771,9 +2771,71 @@ _openai_client = None
 _openai_warning_emitted = False
 _fallback_warning_emitted = False
 
+# whisper.cpp 后端（macOS Metal GPU 加速）
+# 路径选项均为可选，默认自动检测
+WHISPER_CPP_BINARY = _cfg.get("whisper_cpp_binary", "")
+WHISPER_CPP_MODEL = _cfg.get("whisper_cpp_model", "")
+WHISPER_CPP_LANGUAGE = _cfg.get("whisper_cpp_language", "zh")
+WHISPER_CPP_THREADS = _cfg.get("whisper_cpp_threads", 0)
+
+_WHISPER_CPP_BINARY_SEARCH_PATHS = [
+    "/opt/homebrew/bin/whisper-cpp",
+    "/usr/local/bin/whisper-cpp",
+    os.path.expanduser("~/.local/bin/whisper-cpp"),
+]
+
+_WHISPER_CPP_MODEL_SEARCH_PATHS = [
+    os.path.expanduser("~/Library/Application Support/whisper-cpp"),
+    os.path.expanduser("~/Library/Application Support/Recordly/whisper"),
+    os.path.expanduser("~/whisper-models"),
+    os.path.expanduser("~/models"),
+    os.path.expanduser("~/Downloads"),
+    "/opt/homebrew/share/whisper-cpp/models",
+    "/usr/local/share/whisper-cpp/models",
+]
+
+_whisper_cpp_binary_resolved = None   # None=未检测, ""=未找到, str=路径
+_whisper_cpp_model_resolved = None    # 同上
+
+
+def _resolve_whisper_cpp_binary():
+    global _whisper_cpp_binary_resolved
+    if _whisper_cpp_binary_resolved is not None:
+        return _whisper_cpp_binary_resolved
+    if WHISPER_CPP_BINARY:
+        if os.path.isfile(WHISPER_CPP_BINARY) and os.access(WHISPER_CPP_BINARY, os.X_OK):
+            _whisper_cpp_binary_resolved = WHISPER_CPP_BINARY
+            return _whisper_cpp_binary_resolved
+    for p in _WHISPER_CPP_BINARY_SEARCH_PATHS:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            _whisper_cpp_binary_resolved = p
+            return _whisper_cpp_binary_resolved
+    _whisper_cpp_binary_resolved = ""
+    return ""
+
+
+def _resolve_whisper_cpp_model():
+    global _whisper_cpp_model_resolved
+    if _whisper_cpp_model_resolved is not None:
+        return _whisper_cpp_model_resolved
+    if WHISPER_CPP_MODEL:
+        if os.path.isfile(WHISPER_CPP_MODEL):
+            _whisper_cpp_model_resolved = WHISPER_CPP_MODEL
+            return _whisper_cpp_model_resolved
+    for search_dir in _WHISPER_CPP_MODEL_SEARCH_PATHS:
+        if not os.path.isdir(search_dir):
+            continue
+        for f in sorted(os.listdir(search_dir)):
+            if f.startswith("ggml-") and f.endswith(".bin"):
+                _whisper_cpp_model_resolved = os.path.join(search_dir, f)
+                return _whisper_cpp_model_resolved
+    _whisper_cpp_model_resolved = ""
+    return ""
+
 
 def _resolve_active_backend():
-    """两因素 opt-in：openai 需要 flag + key 都齐才生效。"""
+    """两因素 opt-in：openai 需要 flag + key 都齐才生效。
+    whisper_cpp 需要 binary 可检测到，否则回退 local。"""
     global _fallback_warning_emitted
     if TRANSCRIPTION_BACKEND == "openai":
         if not OPENAI_API_KEY:
@@ -2786,6 +2848,18 @@ def _resolve_active_backend():
                 _fallback_warning_emitted = True
             return "local"
         return "openai"
+    if TRANSCRIPTION_BACKEND == "whisper_cpp":
+        if not _resolve_whisper_cpp_binary():
+            if not _fallback_warning_emitted:
+                print(
+                    "[whisper] transcription_backend=whisper_cpp 但未找到 "
+                    "whisper-cpp 二进制文件，回退到本地模型。"
+                    "安装: brew install whisper-cpp",
+                    file=sys.stderr, flush=True,
+                )
+                _fallback_warning_emitted = True
+            return "local"
+        return "whisper_cpp"
     return "local"
 
 
@@ -2794,6 +2868,10 @@ def _cache_signature():
     backend = _resolve_active_backend()
     if backend == "openai":
         return {"backend": "openai", "model_size": OPENAI_WHISPER_MODEL}
+    if backend == "whisper_cpp":
+        model_path = _resolve_whisper_cpp_model()
+        model_name = os.path.basename(model_path) if model_path else "unknown"
+        return {"backend": "whisper_cpp", "model_size": model_name}
     return {"backend": "local", "model_size": LOCAL_WHISPER_MODEL}
 
 
@@ -2865,9 +2943,55 @@ def _transcribe_openai(wav_path):
     }
 
 
+def _transcribe_whisper_cpp(wav_path):
+    """通过 whisper-cpp CLI（Metal GPU 加速）转录。失败抛 RuntimeError。"""
+    binary = _resolve_whisper_cpp_binary()
+    if not binary:
+        raise RuntimeError("whisper-cpp binary 未找到。安装: brew install whisper-cpp")
+    model = _resolve_whisper_cpp_model()
+    if not model:
+        raise RuntimeError(
+            "whisper.cpp 模型未找到。通过 config.json whisper_cpp_model 指定路径，"
+            "或下载: https://huggingface.co/ggerganov/whisper.cpp"
+        )
+
+    threads = WHISPER_CPP_THREADS
+    if not threads:
+        try:
+            threads = min(os.cpu_count() or 4, 8)
+        except Exception:
+            threads = 4
+
+    try:
+        cmd = [
+            binary,
+            "-m", model,
+            "-f", wav_path,
+            "-l", WHISPER_CPP_LANGUAGE,
+            "-t", str(threads),
+            "--no-fallback",
+            "-otxt",
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        txt_path = f"{wav_path}.txt"
+        if os.path.isfile(txt_path):
+            with open(txt_path, encoding="utf-8") as f:
+                text = f.read().strip()
+            os.unlink(txt_path)
+            return {"language": WHISPER_CPP_LANGUAGE, "text": text or ""}
+        return {"language": WHISPER_CPP_LANGUAGE, "text": ""}
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("whisper-cpp 超时 (120s)")
+    except Exception as e:
+        raise RuntimeError(f"whisper-cpp 转录失败: {e}")
+
+
 def _transcribe(wav_path, backend):
     if backend == "openai":
         return _transcribe_openai(wav_path)
+    if backend == "whisper_cpp":
+        return _transcribe_whisper_cpp(wav_path)
     return _transcribe_local(wav_path)
 
 
@@ -2880,13 +3004,14 @@ def transcribe_voice(chat_name: str, local_id: int) -> str:
     和 Whisper 推理）。后端切换或本地模型升级（如 base → small）后，
     旧条目自动视为失效并重新转录。首次运行本地模型会下载约 145MB 权重。
 
-    后端由 config.json 中 transcription_backend 字段控制（local/openai）。
+    后端由 config.json 中 transcription_backend 字段控制（local/openai/whisper_cpp）。
     详见 README "语音转录隐私" 章节。
 
     依赖:
       - 本地后端: pip install silk-python openai-whisper
         (silk-python 的 import 名为 pysilk)
       - OpenAI 后端: pip install silk-python openai
+      - whisper_cpp 后端: brew install whisper-cpp (macOS)
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid
