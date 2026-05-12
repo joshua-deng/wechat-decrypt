@@ -2497,13 +2497,27 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
     names = get_contact_names()
     display_name = names.get(username, username)
 
-    db_path, table_name = _find_msg_table_for_user(username)
-    if not db_path:
+    # 同 chat 的消息会分散在多个 message_N.db shard 里 (上限 ~100MB/shard 时滚动到下一个);
+    # 单 shard 查找会漏掉其他 shard 的图片。其他工具 (get_chat_history / search_messages /
+    # decode_image) 早已用复数版本 scan 全部 shard, 这里对齐一致。
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
         return f"找不到 {display_name} 的消息记录"
 
-    images = _image_resolver.list_chat_images(db_path, table_name, username, limit)
-    if not images:
+    # 每个 shard 取 limit 张, 合并后按 create_time DESC 全局排序, 取最新 limit 张。
+    # 单 shard 至少够本次返回, 避免一个 shard 凑不出 limit 时其他 shard 没机会贡献。
+    all_images = []
+    for shard in shards:
+        shard_images = _image_resolver.list_chat_images(
+            shard['db_path'], shard['table_name'], username, limit
+        )
+        all_images.extend(shard_images)
+
+    if not all_images:
         return f"{display_name} 无图片消息"
+
+    all_images.sort(key=lambda img: img['create_time'], reverse=True)
+    images = all_images[:limit]
 
     lines = []
     for img in images:
