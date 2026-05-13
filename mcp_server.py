@@ -731,25 +731,9 @@ def _format_app_message_text(content, local_type, is_group, chat_username, chat_
     app_type = _parse_int(app_type_text, _parse_int(sub_type, 0))
 
     if app_type == 57:
-        ref = appmsg.find('.//refermsg')
-        ref_user = ''
-        ref_display_name = ''
-        ref_content = ''
-        if ref is not None:
-            ref_user = (ref.findtext('fromusr') or '').strip()
-            ref_display_name = (ref.findtext('displayname') or '').strip()
-            ref_content = _collapse_text(ref.findtext('content') or '')
-        if len(ref_content) > 160:
-            ref_content = ref_content[:160] + "..."
-
-        quote_text = title or "[引用消息]"
-        if ref_content:
-            ref_label = _resolve_quote_sender_label(
-                ref_user, ref_display_name, is_group, chat_username, chat_display_name, names
-            )
-            prefix = f"回复 {ref_label}: " if ref_label else "回复: "
-            quote_text += f"\n  ↳ {prefix}{ref_content}"
-        return quote_text
+        return _format_refer_message_text(
+            appmsg, is_group, chat_username, chat_display_name, names
+        )
 
     if app_type == 19:
         return _format_record_message_text(appmsg, title)
@@ -882,6 +866,135 @@ _TRANSFER_PAYSUBTYPE_LABEL = {
     '7': '待领取',       # 已发起未接收
     '8': '已领取',       # 部分版本：转账被领取（接收方记录）
 }
+
+
+# 微信引用回复（appmsg type=57, <refermsg>）内层 <type> 的标签映射。
+# refermsg/<type> 用的是顶层 base_type 数字（跟 format_msg_type 重合），
+# 但语义不同：format_msg_type 给"消息类型 chip"，这里给"被引用消息的一行摘要"，
+# 不展开 cdn url / aeskey / md5 等二进制元数据（直接截断 XML 字符串当摘要是
+# 现状的 bug，会把"图片/语音/视频/动画表情/嵌套卡片"渲染成乱码——见 issue #44 #45）。
+_REFER_INNER_TYPE_LABEL = {
+    '1': '文本',         # 特殊：直接展开 content
+    '3': '图片',
+    '34': '语音',
+    '42': '名片',
+    '43': '视频',
+    '47': '动画表情',
+    '48': '位置',
+    '49': '链接/卡片',   # 特殊：嵌套 appmsg，进一步解 inner type
+    '50': '通话',
+}
+
+# refer_type=49 时 content 是嵌套 <msg><appmsg>...，inner appmsg/<type> → 标签。
+# 跟合并转发 _RECORD_DATATYPE_LABEL 的数字含义不同（datatype 是 recorditem 的私有
+# schema），独立维护。
+_INNER_APPMSG_TYPE_LABEL = {
+    '5': '链接', '6': '文件', '8': '动画表情卡',
+    '19': '聊天记录', '33': '小程序', '36': '小程序',
+    '51': '视频号', '57': '引用消息',
+    '2000': '转账', '2001': '红包',
+}
+
+
+def _extract_refer_info(appmsg):
+    """从 appmsg type=57 解出 refermsg 各字段，返回 dict 或 None。
+
+    refermsg/<content> 是 escape 后的字符串，内层 type 决定其 schema:
+      type=1 (纯文本) / 3 (img cdn) / 34 (voicemsg) / 47 (emoji)
+      / 49 (嵌套 appmsg) / ...
+
+    refer_content 保留原始字符串（不 collapse），让 _summarize_refer_content
+    按 type 进一步处理（type=49 还要再解一层 XML）。其他字段过 _collapse_text
+    清掉换行/前后空白。
+    """
+    refer = appmsg.find('refermsg')
+    if refer is None:
+        return None
+
+    return {
+        'reply_text': _collapse_text(appmsg.findtext('title') or ''),
+        'refer_type': _collapse_text(refer.findtext('type') or ''),
+        'refer_svrid': _collapse_text(refer.findtext('svrid') or ''),
+        'refer_fromusr': _collapse_text(refer.findtext('fromusr') or ''),
+        'refer_chatusr': _collapse_text(refer.findtext('chatusr') or ''),
+        'refer_displayname': _collapse_text(refer.findtext('displayname') or ''),
+        'refer_content': refer.findtext('content') or '',
+        'refer_createtime': _collapse_text(refer.findtext('createtime') or ''),
+    }
+
+
+def _summarize_refer_content(refer_type, content, max_len=160):
+    """把被引用消息的 content 摘要成一行可读文本。
+
+    分支规则：
+      type=1 (文本): 取原文，截断到 max_len
+      type=3/34/43/47/...: 给标签兜底，不展开 cdn url / aeskey / md5
+      type=49 (嵌套 appmsg): 解一层 inner appmsg/type + title，给"[链接] xxx"
+      未识别 type: 给 [type=N] 兜底，方便用户自查
+
+    max_len 只对 type=1 文本生效；标签型摘要本身就短。
+    """
+    refer_type = (refer_type or '').strip()
+
+    if not content:
+        label = _REFER_INNER_TYPE_LABEL.get(refer_type)
+        if label:
+            return f'[{label}]'
+        return f'[type={refer_type}]' if refer_type else '[引用消息]'
+
+    if refer_type == '1':
+        text = _collapse_text(content)
+        return text[:max_len] + '…' if len(text) > max_len else text
+
+    if refer_type == '49':
+        # 嵌套 appmsg：content 是来源不可信的微信侧 payload，走 _parse_xml_root
+        # 经 _XML_UNSAFE_RE 过滤 DOCTYPE/ENTITY 防 XXE 注入。
+        inner_root = _parse_xml_root(content)
+        if inner_root is None:
+            return '[卡片]'
+        inner_appmsg = inner_root.find('.//appmsg')
+        if inner_appmsg is None:
+            return '[卡片]'
+        inner_type = _collapse_text(inner_appmsg.findtext('type') or '')
+        inner_title = _collapse_text(inner_appmsg.findtext('title') or '')
+        label = _INNER_APPMSG_TYPE_LABEL.get(
+            inner_type, f'卡片 type={inner_type}' if inner_type else '卡片'
+        )
+        return f'[{label}] {inner_title}' if inner_title else f'[{label}]'
+
+    label = _REFER_INNER_TYPE_LABEL.get(refer_type)
+    if label:
+        return f'[{label}]'
+    return f'[type={refer_type}]'
+
+
+def _format_refer_message_text(appmsg, is_group, chat_username, chat_display_name, names):
+    """渲染微信引用回复（appmsg type=57）的两行展示文本。
+
+    格式:
+      <用户的回复正文>
+        ↳ 回复 <对方>: <被引用消息摘要>
+
+    fallback:
+      1) refermsg 缺失 → 退回到外层 title 兜底
+      2) refer_content 空 → summary 给"[refer_type 标签]"或"[引用消息]"
+      3) sender 解析不出来 → "回复:" 不带名字
+    """
+    info = _extract_refer_info(appmsg)
+    if info is None:
+        title = _collapse_text(appmsg.findtext('title') or '')
+        return title or '[引用消息]'
+
+    summary = _summarize_refer_content(info['refer_type'], info['refer_content'])
+    sender_label = _resolve_quote_sender_label(
+        info['refer_fromusr'], info['refer_displayname'],
+        is_group, chat_username, chat_display_name, names
+    )
+
+    quote_text = info['reply_text'] or '[引用消息]'
+    prefix = f'回复 {sender_label}: ' if sender_label else '回复: '
+    quote_text += f'\n  ↳ {prefix}{summary}'
+    return quote_text
 
 
 def _extract_transfer_info(appmsg):
@@ -2762,6 +2875,151 @@ def decode_transfer(chat_name: str, local_id: int, create_time: int = 0) -> str:
         lines.append(f"  支付交易号: {info['transcation_id']}")
     if info['pay_msg_id']:
         lines.append(f"  paymsgid: {info['pay_msg_id']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def decode_refer(chat_name: str, local_id: int, create_time: int = 0) -> str:
+    """读取微信引用回复消息（appmsg type=57）的结构化信息。
+
+    返回回复正文、被引用消息的发送者/类型/摘要/svrid/createtime。被引用消息的
+    type 决定摘要风格：1 文本展开原文，3/34/43/47/48/50 给 [图片]/[语音]/...
+    标签，49 嵌套 appmsg 解一层 inner type 给 [链接] xxx。svrid 可用于回查
+    原消息（在 history / export_chat 输出里搜）。
+
+    使用流程：先用 get_chat_history 找到 [引用消息] 行 (local_id=N, ts=T)，
+    把 N 和 T 一起传进来。create_time(ts) 用于跨分片场景下唯一定位。
+
+    Args:
+        chat_name: 聊天对象的名字、备注名或 wxid
+        local_id: 引用消息的 local_id（从 get_chat_history 获取）
+        create_time: 消息的 unix 时间戳，从 get_chat_history 输出 ts=N 部分获取。
+            用于在 local_id 跨分片冲突时唯一定位；传 0 时若多个分片含同 local_id 会报歧义错误
+    """
+    try:
+        local_id = int(local_id)
+        create_time = int(create_time)
+    except (TypeError, ValueError):
+        return "错误: local_id 和 create_time 必须是整数"
+
+    username = resolve_username(chat_name)
+    if not username:
+        return f"找不到聊天对象: {chat_name}"
+
+    shards = _find_msg_tables_for_user(username)
+    if not shards:
+        return f"找不到 {chat_name} 的消息表"
+
+    matches = []
+    for shard in shards:
+        if not _is_safe_msg_table_name(shard['table_name']):
+            continue
+        with closing(sqlite3.connect(shard['db_path'])) as conn:
+            if create_time:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=? AND create_time=?",
+                    (local_id, create_time)
+                ).fetchone()
+            else:
+                candidate_row = conn.execute(
+                    f"SELECT local_type, create_time, message_content, WCDB_CT_message_content "
+                    f"FROM [{shard['table_name']}] WHERE local_id=?",
+                    (local_id,)
+                ).fetchone()
+        if candidate_row:
+            matches.append((shard['db_path'], candidate_row))
+
+    if not matches:
+        if create_time:
+            return f"找不到 (local_id={local_id}, create_time={create_time}) 的消息（已扫描 {len(shards)} 个分片）"
+        return f"找不到 local_id={local_id} 的消息（已扫描 {len(shards)} 个分片）"
+    if len(matches) > 1:
+        details = []
+        for db_p, r in matches:
+            ct = r[1]
+            ts_str = datetime.fromtimestamp(ct).isoformat() if ct else '?'
+            details.append(f"{os.path.basename(db_p)} create_time={ct} ({ts_str})")
+        return (
+            f"local_id={local_id} 在 {len(matches)} 个分片中都存在，无法唯一定位:\n  "
+            + '\n  '.join(details)
+            + f"\n请加 create_time 参数：decode_refer(chat_name, local_id={local_id}, create_time=N)"
+        )
+
+    _, row = matches[0]
+    local_type, msg_create_time, content, ct_compress = row
+    base_type, _ = _split_msg_type(local_type)
+    if base_type != 49:
+        return (
+            f"不是引用消息（local_type={local_type}, base_type={base_type}），"
+            f"引用消息应为 base_type=49 + appmsg type=57"
+        )
+
+    xml_text = _decompress_content(content, ct_compress)
+    if not xml_text:
+        return "消息 content 为空或无法解码"
+
+    is_group = username.endswith('@chatroom')
+    _, xml_text = _parse_message_content(xml_text, local_type, is_group)
+
+    root = _parse_app_message_outer(xml_text)
+    if root is None:
+        return "无法解析消息 XML"
+    appmsg = root.find('.//appmsg')
+    if appmsg is None:
+        return "消息中没有 appmsg 段（不像引用回复）"
+
+    app_type = _parse_int(_collapse_text(appmsg.findtext('type') or ''), 0)
+    if app_type != 57:
+        return (
+            f"不是引用消息（appmsg type={app_type}）。"
+            f"引用回复要求 appmsg type=57；type=6 是文件、type=19 是合并转发、"
+            f"type=2000 是转账，请用对应的 decode_file_message / decode_record_item / "
+            f"decode_transfer 工具"
+        )
+
+    info = _extract_refer_info(appmsg)
+    if info is None:
+        return "消息是 type=57 但缺 <refermsg> 节点（schema 异常）"
+
+    refer_type_label = _REFER_INNER_TYPE_LABEL.get(info['refer_type'], '')
+    summary = _summarize_refer_content(info['refer_type'], info['refer_content'])
+    sender_label = _resolve_quote_sender_label(
+        info['refer_fromusr'], info['refer_displayname'],
+        is_group, username, chat_name, get_contact_names()
+    )
+
+    def _fmt_ts(ts_str):
+        ts = _parse_int(ts_str, 0)
+        if not ts:
+            return ''
+        try:
+            return datetime.fromtimestamp(ts).isoformat()
+        except (ValueError, OSError, OverflowError):
+            return f'(无效 ts={ts_str})'
+
+    lines = [f"引用回复消息: {info['reply_text'] or '(无回复正文)'}"]
+    if sender_label:
+        lines.append(f"  被引用消息发送者: {sender_label}")
+    if info['refer_displayname']:
+        lines.append(f"  被引用消息显示名: {info['refer_displayname']}")
+    if info['refer_fromusr']:
+        lines.append(f"  被引用消息 from: {info['refer_fromusr']}")
+    if info['refer_chatusr']:
+        lines.append(f"  被引用消息 chatusr (群内发送者 wxid): {info['refer_chatusr']}")
+    raw_type = info['refer_type'] or '?'
+    type_display = (
+        f"{refer_type_label} (refer_type={raw_type})"
+        if refer_type_label else f"refer_type={raw_type}"
+    )
+    lines.append(f"  被引用消息类型: {type_display}")
+    lines.append(f"  被引用消息摘要: {summary}")
+    refer_ts = _fmt_ts(info['refer_createtime'])
+    if refer_ts:
+        lines.append(f"  被引用消息创建时间: {refer_ts}")
+    if info['refer_svrid']:
+        lines.append(f"  被引用消息 server_id: {info['refer_svrid']}")
+
     return "\n".join(lines)
 
 
