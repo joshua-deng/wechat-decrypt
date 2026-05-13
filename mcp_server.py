@@ -225,6 +225,15 @@ _contact_names = None  # {username: display_name}
 _contact_full = None   # [{username, nick_name, remark}]
 _contact_tags = None   # {label_id: {name, sort_order, members: [{username, display_name}]}}
 _self_username = None
+_contact_db_mtime = 0  # mtime of the decrypted contact.db when caches were last populated
+
+
+def _invalidate_contact_caches():
+    global _contact_names, _contact_full, _contact_tags, _self_username
+    _contact_names = None
+    _contact_full = None
+    _contact_tags = None
+    _self_username = None
 _XML_UNSAFE_RE = re.compile(r'<!DOCTYPE|<!ENTITY', re.IGNORECASE)
 _XML_PARSE_MAX_LEN = 20000
 _QUERY_LIMIT_MAX = 500
@@ -246,45 +255,55 @@ def _load_contacts_from(db_path):
     return names, full
 
 
+def _get_contact_db_path():
+    """获取 contact.db 路径并按 mtime 决定是否清缓存。
+
+    优先实时解密路径（DBCache 已经按源 mtime 触发重解密），其次回退到
+    静态已解密副本。任何一次 mtime 变化都使内存缓存失效，避免新增联系人
+    或改名/改备注后 MCP 查询仍读到旧数据。
+    """
+    global _contact_db_mtime
+
+    path = _cache.get(os.path.join("contact", "contact.db"))
+    if not path:
+        pre = os.path.join(DECRYPTED_DIR, "contact", "contact.db")
+        path = pre if os.path.exists(pre) else None
+
+    if not path:
+        return None
+
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return path
+
+    if mt != _contact_db_mtime:
+        _invalidate_contact_caches()
+        _contact_db_mtime = mt
+
+    return path
+
+
 def get_contact_names():
     global _contact_names, _contact_full
+
+    path = _get_contact_db_path()
+    if not path:
+        return {}
+
     if _contact_names is not None:
         return _contact_names
 
-    # 优先用已解密的 contact.db
-    pre_decrypted = os.path.join(DECRYPTED_DIR, "contact", "contact.db")
-    if os.path.exists(pre_decrypted):
-        try:
-            _contact_names, _contact_full = _load_contacts_from(pre_decrypted)
-            return _contact_names
-        except Exception:
-            pass
-
-    # 实时解密
-    path = _cache.get(os.path.join("contact", "contact.db"))
-    if path:
-        try:
-            _contact_names, _contact_full = _load_contacts_from(path)
-            return _contact_names
-        except Exception:
-            pass
-
-    return {}
+    try:
+        _contact_names, _contact_full = _load_contacts_from(path)
+        return _contact_names
+    except Exception:
+        return {}
 
 
 def get_contact_full():
-    global _contact_full
-    if _contact_full is None:
-        get_contact_names()
+    get_contact_names()
     return _contact_full or []
-
-
-def _get_contact_db_path():
-    """获取 contact.db 路径（优先已解密，其次实时解密）"""
-    pre = os.path.join(DECRYPTED_DIR, "contact", "contact.db")
-    if os.path.exists(pre):
-        return pre
-    return _cache.get(os.path.join("contact", "contact.db"))
 
 
 def _extract_pb_field_30(data):
@@ -335,12 +354,13 @@ def _extract_pb_field_30(data):
 def _load_contact_tags():
     """加载并缓存联系人标签数据"""
     global _contact_tags
-    if _contact_tags is not None:
-        return _contact_tags
 
     db_path = _get_contact_db_path()
     if not db_path:
         return {}
+
+    if _contact_tags is not None:
+        return _contact_tags
 
     try:
         conn = sqlite3.connect(db_path)
@@ -483,13 +503,15 @@ def _collapse_text(text):
 
 def _get_self_username():
     global _self_username
-    if _self_username:
-        return _self_username
 
     if not DB_DIR:
         return ''
 
     names = get_contact_names()
+
+    if _self_username:
+        return _self_username
+
     account_dir = os.path.basename(os.path.dirname(DB_DIR))
     candidates = [account_dir]
 
