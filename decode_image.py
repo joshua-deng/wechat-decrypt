@@ -277,6 +277,140 @@ def decrypt_dat_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     return xor_decrypt_file(dat_path, out_path)
 
 
+def decode_all_dats(attach_dir, out_dir, aes_key=None, xor_key=0x88,
+                    force=False, progress_every=200, on_file=None):
+    """批量解密 attach_dir 下所有 .dat 图片到 out_dir 的镜像目录树。
+
+    输入路径形态(微信本地约定):
+        <attach_dir>/<chat_hash>/<YYYY-MM>/Img/<file_md5>[_t|_h].dat
+
+      其中 chat_hash = md5(username).hexdigest(),username 是 wxid 或
+      <id>@chatroom;_t/_h 分别是缩略图 / 高清缩略图后缀。
+
+    输出路径形态(镜像 + 移除 _t/_h 缩略图后缀,平铺到原图 basename):
+        <out_dir>/<chat_hash>/<YYYY-MM>/<file_md5>.<ext>
+
+      其中 <ext> 由 magic 自动检测(jpg / png / gif / webp / hevc 等)。
+      wxgf 容器输出 .hevc;不在 upstream 做 mp4 转换(scope 留给下游)。
+
+    幂等性:目标存在(任何扩展名,基于 basename)时跳过,无需 mtime 比较 ——
+      .dat 是 content-hash 命名,实际上 write-once。force=True 强制重解。
+
+    原子写:解密先写到 <basename>.<ext>.tmp(同目录),`os.replace` 重命名
+      到最终路径,中断不留半文件。
+
+    错误隔离:单文件失败不阻塞批次。V2 文件遇到 aes_key=None 计入
+      skipped_no_key(可恢复:跑 find_image_key_macos.py 提取 key 后重跑)。
+
+    Args:
+      attach_dir:     微信 msg/attach 根目录(含 chat_hash 子目录)
+      out_dir:        输出根目录
+      aes_key:        V2 AES key(16 字节 str/bytes);V1 / 老 XOR 不需要
+      xor_key:        V2 XOR key(默认 0x88)
+      force:          True 时忽略已存在目标重新解密
+      progress_every: 每解 N 个文件打一行进度到 stderr;None 关闭(测试用)
+      on_file:        可选回调 (i, total, dat_path, status, fmt) 每文件调用一次,
+                      status ∈ {"decoded", "skipped", "skipped_no_key", "failed"}
+
+    Returns:
+      dict {decoded, skipped, skipped_no_key, failed, total, formats}
+        formats: dict[ext, count]
+    """
+    pattern = os.path.join(attach_dir, "*", "*", "Img", "*.dat")
+    dat_files = sorted(glob.glob(pattern))
+
+    decoded = 0
+    skipped = 0
+    skipped_no_key = 0
+    failed = 0
+    formats = {}
+
+    for i, dat_path in enumerate(dat_files):
+        rel = os.path.relpath(dat_path, attach_dir)
+        parts = rel.split(os.sep)
+        if len(parts) != 4 or parts[2] != "Img":
+            failed += 1
+            print(f"[WARN] 跳过非标准路径: {rel}", file=sys.stderr)
+            if on_file:
+                on_file(i, len(dat_files), dat_path, "failed", None)
+            continue
+        chat_hash, ym, _img, fname = parts
+        basename = os.path.splitext(fname)[0]  # 去 .dat
+        for suffix in ("_t", "_h"):
+            if basename.endswith(suffix):
+                basename = basename[:-len(suffix)]
+                break
+
+        target_dir = os.path.join(out_dir, chat_hash, ym)
+
+        # 幂等性:目标 basename 已存在(任何 ext,排除 .tmp)
+        if not force:
+            existing = [
+                p for p in glob.glob(os.path.join(target_dir, f"{basename}.*"))
+                if not p.endswith(".tmp")
+            ]
+            if existing:
+                skipped += 1
+                if on_file:
+                    on_file(i, len(dat_files), dat_path, "skipped", None)
+                continue
+
+        # V2 文件需要 key;无 key 时计入 skipped_no_key
+        if is_v2_format(dat_path) and aes_key is None:
+            skipped_no_key += 1
+            if on_file:
+                on_file(i, len(dat_files), dat_path, "skipped_no_key", None)
+            if progress_every and (i + 1) % progress_every == 0:
+                print(
+                    f"  ...扫描 {i+1}/{len(dat_files)} (解码 {decoded}, 跳过 {skipped}, "
+                    f"无 key {skipped_no_key}, 失败 {failed})",
+                    file=sys.stderr,
+                )
+            continue
+
+        os.makedirs(target_dir, exist_ok=True)
+        tmp_path = os.path.join(target_dir, f"{basename}.unknown.tmp")
+        fmt = None
+        try:
+            result_path, fmt = decrypt_dat_file(dat_path, tmp_path, aes_key, xor_key)
+            if result_path is None or fmt is None:
+                failed += 1
+                if os.path.exists(tmp_path):
+                    try: os.remove(tmp_path)
+                    except OSError: pass
+            else:
+                final_path = os.path.join(target_dir, f"{basename}.{fmt}")
+                os.replace(result_path, final_path)
+                decoded += 1
+                formats[fmt] = formats.get(fmt, 0) + 1
+        except Exception as e:
+            failed += 1
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except OSError: pass
+            print(f"[WARN] {rel}: {e}", file=sys.stderr)
+
+        if on_file:
+            status = "decoded" if fmt else "failed"
+            on_file(i, len(dat_files), dat_path, status, fmt)
+
+        if progress_every and (i + 1) % progress_every == 0:
+            print(
+                f"  ...扫描 {i+1}/{len(dat_files)} (解码 {decoded}, 跳过 {skipped}, "
+                f"无 key {skipped_no_key}, 失败 {failed})",
+                file=sys.stderr,
+            )
+
+    return {
+        "decoded": decoded,
+        "skipped": skipped,
+        "skipped_no_key": skipped_no_key,
+        "failed": failed,
+        "total": len(dat_files),
+        "formats": formats,
+    }
+
+
 def extract_md5_from_packed_info(blob):
     """从 message_resource.db 的 packed_info (protobuf) 中提取文件 MD5
 
