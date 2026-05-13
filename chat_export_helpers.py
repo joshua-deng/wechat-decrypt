@@ -167,6 +167,17 @@ def _extract_content(local_id, local_type, content, ct, chat_username, chat_disp
     if content is None:
         return None, None
 
+    # 群消息的 content 形如 'wxid_xxx:\n<xml...>'。Issue #88: 之前直接把
+    # 带前缀的字符串喂给 XML 解析器，群里的引用回复 / 卡片 / 视频等都因
+    # 解析失败导致 type 渲染成 link_or_file 且 content 为空。
+    is_group = bool(chat_username) and chat_username.endswith('@chatroom')
+    if is_group:
+        _, content = mcp_server._parse_message_content(content, local_type, True)
+
+    # names 用于群引用回复的发送者名解析（_resolve_quote_sender_label）。
+    # 1-on-1 场景也能用到（按 wxid 查显示名）。
+    names = mcp_server.get_contact_names()
+
     base, _ = mcp_server._split_msg_type(local_type)
     if base == 1:
         return (content or ""), None
@@ -176,7 +187,7 @@ def _extract_content(local_id, local_type, content, ct, chat_username, chat_disp
         return _format_sticker_message(content), None
     if base == 49:
         rendered = mcp_server._format_app_message_text(
-            content, local_type, False, chat_username, chat_display_name, {}
+            content, local_type, is_group, chat_username, chat_display_name, names
         )
         transfer = _extract_transfer_extras(content)
         extras = {'type': 'transfer', 'transfer': transfer} if transfer else None
