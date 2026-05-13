@@ -951,6 +951,21 @@ def _format_voip_message_text(content):
     return f"[通话] {status_map.get(raw_text, raw_text)}"
 
 
+def _format_voice_text(content):
+    if not content or '<voicemsg' not in content:
+        return "[语音]"
+    root = _parse_xml_root(content)
+    if root is None:
+        return "[语音]"
+    voice = root.find('.//voicemsg')
+    if voice is None:
+        return "[语音]"
+    length_ms = _parse_int(voice.get('voicelength'), 0)
+    if length_ms <= 0:
+        return "[语音]"
+    return f"[语音 {length_ms / 1000:.1f}s]"
+
+
 def _format_message_text(local_id, local_type, content, is_group, chat_username, chat_display_name, names, create_time=0):
     sender_from_content, text = _parse_message_content(content, local_type, is_group)
     base_type, _ = _split_msg_type(local_type)
@@ -963,6 +978,8 @@ def _format_message_text(local_id, local_type, content, is_group, chat_username,
 
     if base_type == 3:
         text = f"[图片] {_id_suffix()}"
+    elif base_type == 34:
+        text = f"{_format_voice_text(text)} {_id_suffix()}"
     elif base_type == 47:
         text = "[表情]"
     elif base_type == 50:
