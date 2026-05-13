@@ -9,6 +9,7 @@ import hashlib, struct, os, sys, json
 import hmac as hmac_mod
 from Crypto.Cipher import AES
 
+import argparse
 import functools
 print = functools.partial(print, flush=True)
 
@@ -106,6 +107,21 @@ def decrypt_database(db_path, out_path, enc_key):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="WeChat 4.0 数据库解密器"
+    )
+    parser.add_argument(
+        "-i", "--incremental",
+        action="store_true",
+        help="增量模式：仅当源 .db 更新于已解密文件时才重新解密",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="预览模式：显示将要解密的数据库列表",
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  WeChat 4.0 数据库解密器")
     print("=" * 60)
@@ -113,7 +129,7 @@ def main():
     # 加载密钥
     if not os.path.exists(KEYS_FILE):
         print(f"[ERROR] 密钥文件不存在: {KEYS_FILE}")
-        print("请先运行 find_all_keys.py")
+        print("请先运行 python main.py decrypt 提取密钥并解密")
         sys.exit(1)
 
     with open(KEYS_FILE, encoding="utf-8") as f:
@@ -122,6 +138,8 @@ def main():
     keys = strip_key_metadata(keys)
     print(f"\n加载 {len(keys)} 个数据库密钥")
     print(f"输出目录: {OUT_DIR}")
+    if args.incremental:
+        print(f"模式: 增量 (跳过未变更的数据库)")
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # 收集所有DB文件
@@ -141,20 +159,41 @@ def main():
     success = 0
     failed = 0
     skipped = 0
+    skipped_unmodified = 0
     total_bytes = 0
 
     for rel, path, sz in db_files:
         key_info = get_key_info(keys, rel)
         if not key_info:
-            print(f"SKIP: {rel} (无密钥)")
+            print(f"SKIP: {rel} (无密钥，如已安装微信补丁可能需要重新运行密钥提取)")
             skipped += 1
             continue
 
-        enc_key = bytes.fromhex(key_info["enc_key"])
         out_path = os.path.join(OUT_DIR, rel)
 
-        print(f"解密: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")
+        # 增量模式：检查 mtime
+        if args.incremental and os.path.exists(out_path):
+            src_mtime = os.path.getmtime(path)
+            dst_mtime = os.path.getmtime(out_path)
+            if src_mtime <= dst_mtime:
+                skipped_unmodified += 1
+                if args.dry_run:
+                    print(f"SKIP: {rel} (未修改)")
+                continue
+            elif args.dry_run:
+                print(f"NEW: {rel} (源较新)")
+            elif not args.dry_run:
+                print(f"更新: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")
+        elif args.dry_run:
+            print(f"NEW: {rel} ({sz/1024/1024:.1f}MB)")
+        else:
+            print(f"解密: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")
 
+        if args.dry_run:
+            skipped_unmodified += 1
+            continue
+
+        enc_key = bytes.fromhex(key_info["enc_key"])
         ok = decrypt_database(path, out_path, enc_key)
         if ok:
             # SQLite验证
@@ -186,8 +225,14 @@ def main():
                 except OSError:
                     pass
 
+    if args.dry_run:
+        print(f"\n{'='*60}")
+        print(f"预览: 需要解密 {skipped_unmodified} 个数据库")
+        return
+
     print(f"\n{'='*60}")
-    print(f"结果: {success} 成功, {failed} 失败, {skipped} 跳过(无密钥), 共 {len(db_files)} 个")
+    inc_note = f" (跳过 {skipped_unmodified} 个未变更)" if skipped_unmodified else ""
+    print(f"结果: {success} 成功, {failed} 失败, {skipped} 跳过(无密钥){inc_note}, 共 {len(db_files)} 个")
     print(f"解密数据量: {total_bytes/1024/1024/1024:.1f}GB")
     print(f"解密文件在: {OUT_DIR}")
 
