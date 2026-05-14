@@ -1149,6 +1149,17 @@ def _parse_time_range(start_time='', end_time=''):
     return start_ts, end_ts
 
 
+def _pagination_hint(count, limit, offset):
+    """当返回结果数 == limit 时，提示调用方可能还有更多。
+
+    用于工具返回字符串末尾，帮助 LLM 决定是否需要继续翻页。
+    返回结果数 < limit 表示已读到当前查询条件下的全部结果，不再提示。
+    """
+    if limit and count >= limit:
+        return f"\n\n（可能还有更多结果，可设 offset={offset + limit} 继续查询）"
+    return ""
+
+
 def _build_message_filters(start_ts=None, end_ts=None, keyword=''):
     clauses = []
     params = []
@@ -1537,7 +1548,7 @@ def _search_single_chat(ctx, keyword, start_ts, end_ts, start_time, end_time, li
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     if failures:
         header += "\n查询失败: " + "；".join(failures)
-    return header + ":\n\n" + "\n\n".join(item[1] for item in paged)
+    return header + ":\n\n" + "\n\n".join(item[1] for item in paged) + _pagination_hint(len(paged), limit, offset)
 
 
 def _search_multiple_chats(chat_names, keyword, start_ts, end_ts, start_time, end_time, limit, offset):
@@ -1597,7 +1608,7 @@ def _search_multiple_chats(chat_names, keyword, start_ts, end_ts, start_time, en
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     if notes:
         header += "\n" + "\n".join(notes)
-    return header + ":\n\n" + "\n\n".join(item[1] for item in paged)
+    return header + ":\n\n" + "\n\n".join(item[1] for item in paged) + _pagination_hint(len(paged), limit, offset)
 
 
 def _search_all_messages(keyword, start_ts, end_ts, start_time, end_time, limit, offset):
@@ -1643,7 +1654,7 @@ def _search_all_messages(keyword, start_ts, end_ts, start_time, end_time, limit,
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     if failures:
         header += "\n查询失败: " + "；".join(failures)
-    return header + ":\n\n" + "\n\n".join(item[1] for item in paged)
+    return header + ":\n\n" + "\n\n".join(item[1] for item in paged) + _pagination_hint(len(paged), limit, offset)
 
 
 # ============ MCP Server ============
@@ -1759,7 +1770,7 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
     if failures:
         header += "\n查询失败: " + "；".join(failures)
-    return header + ":\n\n" + "\n".join(lines)
+    return header + ":\n\n" + "\n".join(lines) + _pagination_hint(len(lines), limit, offset)
 
 
 @mcp.tool()
@@ -1854,6 +1865,7 @@ def get_contacts(query: str = "", limit: int = 50) -> str:
     else:
         filtered = contacts
 
+    total = len(filtered)
     filtered = filtered[:limit]
 
     if not filtered:
@@ -1871,7 +1883,10 @@ def get_contacts(query: str = "", limit: int = 50) -> str:
     header = f"找到 {len(filtered)} 个联系人"
     if query:
         header += f"（搜索: {query}）"
-    return header + ":\n\n" + "\n".join(lines)
+    result = header + ":\n\n" + "\n".join(lines)
+    if total > limit:
+        result += f"\n\n（共 {total} 个匹配，当前仅显示前 {limit} 个，可增大 limit 查看更多）"
+    return result
 
 
 @mcp.tool()
@@ -2818,7 +2833,7 @@ def get_chat_images(chat_name: str, limit: int = 20) -> str:
             line += "  (无资源信息)"
         lines.append(line)
 
-    return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines)
+    return f"{display_name} 的 {len(lines)} 张图片:\n\n" + "\n".join(lines) + _pagination_hint(len(lines), limit, 0)
 
 
 # ============ 语音解密 ============
@@ -2931,7 +2946,7 @@ def get_voice_messages(chat_name: str, limit: int = 20) -> str:
         time_str = datetime.fromtimestamp(create_time).strftime('%Y-%m-%d %H:%M')
         lines.append(f"[{time_str}] local_id={local_id}  {size/1024:.0f}KB")
 
-    return f"{display_name} 的 {len(lines)} 条语音消息:\n\n" + "\n".join(lines)
+    return f"{display_name} 的 {len(lines)} 条语音消息:\n\n" + "\n".join(lines) + _pagination_hint(len(lines), limit, 0)
 
 
 @mcp.tool()
