@@ -33,7 +33,7 @@ class GetChatImagesMultiShardTests(unittest.TestCase):
 
     def _run(self, shards, shard_images_map, limit=20):
         """Helper: stub the two collaborators and call the tool."""
-        def fake_list(db_path, table_name, username, lim):
+        def fake_list(db_path, table_name, username, limit=20, start_ts=None, end_ts=None):
             return shard_images_map.get(db_path, [])
 
         with patch.object(mcp_server, "_find_msg_tables_for_user",
