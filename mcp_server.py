@@ -1149,7 +1149,42 @@ def _parse_time_range(start_time='', end_time=''):
     return start_ts, end_ts
 
 
-def _build_message_filters(start_ts=None, end_ts=None, keyword=''):
+_MSG_TYPE_MAP = {
+    'text': [1],
+    'image': [3],
+    'voice': [34],
+    'namecard': [42],
+    'video': [43],
+    'emoji': [47],
+    'location': [48],
+    'app': [49],
+    'voip': [50],
+    'system': [10000],
+}
+
+
+def _resolve_msg_types(msg_types):
+    """把 ['text', 'image'] 风格的输入翻成 local_type 整数列表。
+
+    返回 (type_filter_list, error_msg); 任一项无效返回 (None, error)。
+    None / 空列表表示不过滤。
+    """
+    if not msg_types:
+        return None, None
+    type_filter = []
+    for t in msg_types:
+        key = t.strip().lower()
+        if key == 'file':
+            key = 'app'  # 'file' 是常见叫法; WeChat 把文件归到 type=49 (app message)
+        if key not in _MSG_TYPE_MAP:
+            return None, (
+                f"未知消息类型 \"{t}\"。可选: " + ", ".join(sorted(_MSG_TYPE_MAP))
+            )
+        type_filter.extend(_MSG_TYPE_MAP[key])
+    return type_filter, None
+
+
+def _build_message_filters(start_ts=None, end_ts=None, keyword='', type_filter=None):
     clauses = []
     params = []
     if start_ts is not None:
@@ -1161,14 +1196,18 @@ def _build_message_filters(start_ts=None, end_ts=None, keyword=''):
     if keyword:
         clauses.append('message_content LIKE ?')
         params.append(f'%{keyword}%')
+    if type_filter:
+        placeholders = ','.join('?' * len(type_filter))
+        clauses.append(f'local_type IN ({placeholders})')
+        params.extend(type_filter)
     return clauses, params
 
 
-def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0, oldest_first=False):
+def _query_messages(conn, table_name, start_ts=None, end_ts=None, keyword='', limit=20, offset=0, oldest_first=False, type_filter=None):
     if not _is_safe_msg_table_name(table_name):
         raise ValueError(f'非法消息表名: {table_name}')
 
-    clauses, params = _build_message_filters(start_ts, end_ts, keyword)
+    clauses, params = _build_message_filters(start_ts, end_ts, keyword, type_filter)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ''
     order = 'ASC' if oldest_first else 'DESC'
     sql = f"""
@@ -1365,7 +1404,7 @@ def _page_ranked_entries(entries, limit, offset, oldest_first=False):
     return paged
 
 
-def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20, offset=0, oldest_first=False):
+def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20, offset=0, oldest_first=False, type_filter=None):
     collected = []
     failures = []
     candidate_limit = _candidate_page_size(limit, offset)
@@ -1387,6 +1426,7 @@ def _collect_chat_history_lines(ctx, names, start_ts=None, end_ts=None, limit=20
                         limit=batch_size,
                         offset=fetch_offset,
                         oldest_first=oldest_first,
+                        type_filter=type_filter,
                     )
                     if not rows:
                         break
@@ -1713,7 +1753,7 @@ def get_recent_sessions(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_time: str = "", end_time: str = "", oldest_first: bool = False) -> str:
+def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_time: str = "", end_time: str = "", oldest_first: bool = False, msg_types: list[str] | None = None) -> str:
     """获取指定聊天的消息记录。
 
     Args:
@@ -1723,12 +1763,18 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         start_time: 起始时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
         end_time: 结束时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
         oldest_first: 为 True 时返回最早的消息（默认 False 返回最新消息）
+        msg_types: 按消息类型过滤，可选值: text, image, voice, video, file(=app),
+            emoji, location, namecard, voip, system。传 None 或不传表示不过滤
     """
     try:
         _validate_pagination(limit, offset, limit_max=None)
         start_ts, end_ts = _parse_time_range(start_time, end_time)
     except ValueError as e:
         return f"错误: {e}"
+
+    type_filter, type_err = _resolve_msg_types(msg_types)
+    if type_err:
+        return f"错误: {type_err}"
 
     ctx = _resolve_chat_context(chat_name)
     if not ctx:
@@ -1745,6 +1791,7 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         limit=limit,
         offset=offset,
         oldest_first=oldest_first,
+        type_filter=type_filter,
     )
 
     if not lines:
@@ -1757,6 +1804,8 @@ def get_chat_history(chat_name: str, limit: int = 50, offset: int = 0, start_tim
         header += " [群聊]"
     if start_time or end_time:
         header += f"\n时间范围: {start_time or '最早'} ~ {end_time or '最新'}"
+    if msg_types:
+        header += f"\n类型过滤: {', '.join(msg_types)}"
     if failures:
         header += "\n查询失败: " + "；".join(failures)
     return header + ":\n\n" + "\n".join(lines)
