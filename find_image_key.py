@@ -333,9 +333,15 @@ def verify_and_decrypt(attach_dir, aes_key_str, xor_key):
 
 
 def main():
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-    with open(config_path, encoding="utf-8") as f:
-        config = json.load(f)
+    from config import _config_file_path, load_config
+    config_path = _config_file_path()
+    # 加载完整配置用于逻辑，读取原始 JSON 用于保存
+    config = load_config()
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config_raw = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        config_raw = {}
 
     db_dir = os.path.expanduser(os.path.expandvars(config['db_dir']))
     base_dir = os.path.dirname(db_dir)
@@ -392,8 +398,11 @@ def main():
         config['image_aes_key'] = aes_key
         if xor_key is not None:
             config['image_xor_key'] = xor_key
+        config_raw['image_aes_key'] = aes_key
+        if xor_key is not None:
+            config_raw['image_xor_key'] = xor_key
         with open(config_path, 'w', encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+            json.dump(config_raw, f, indent=2, ensure_ascii=False)
         print(f"Saved to {config_path}", flush=True)
 
         print("\n=== Verify decrypt ===", flush=True)

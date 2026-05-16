@@ -280,10 +280,20 @@ make help       # 列出所有命令
 | `export_chat.py` | 单会话导出（供 export_all_chats.py 内部调用） |
 | `chat_export_helpers.py` | 导出格式化共享函数（两脚本共用，避免代码漂移） |
 | `transcribe_chat.py` | 语音消息转录（共享 config.json 配置的 backend） |
+| `app_gui.py` | **GUI 工具箱** — tkinter 界面，整合解密/导出/音频转换 |
+| `export_messages.py` | 聊天记录导出（CSV / HTML / JSON） |
+| `voice_to_mp3.py` | 语音消息 SILK 转 MP3 |
+| `build.bat` | 一键打包为单 exe（PyInstaller） |
+| `config.py` | 配置加载器（自动检测微信数据目录） |
+| `find_all_keys.py` | 平台分发入口（Windows / Linux） |
+| `find_all_keys_windows.py` | Windows 版内存扫描提 key |
+| `find_all_keys_linux.py` | Linux 版内存扫描提 key |
+| `find_wxwork_keys.py` | 企业微信 Windows 版内存扫描提 key |
+| `decrypt_wxwork_db.py` | 企业微信 wxSQLite3 AES-128 数据库解密 |
+| `export_wxwork_messages.py` | 企业微信聊天记录导出（按个人/群筛选，CSV / HTML / JSON） |
 | `mcp_server.py` | MCP Server，让 Claude AI 查询微信数据 |
 | `monitor_web.py` | 实时消息监听 (Web UI + SSE) |
 | `monitor.py` | 实时消息监听 (命令行) |
-| `find_all_keys.py` | 平台分发入口（Windows / Linux） |
 | `find_all_keys_macos.c` | macOS 版内存密钥扫描器 (C, Mach VM API) |
 | `find_image_key.py` | 从进程内存提取图片 AES 密钥（Windows / Linux） |
 | `find_image_key_macos.py` | macOS 版图片密钥派生（从磁盘 kvcomm 缓存推算） |
@@ -303,6 +313,35 @@ make help       # 列出所有命令
 - **每个数据库有独立的 salt 和 enc_key**
 
 WCDB (微信的 SQLCipher 封装) 会在进程内存中缓存派生后的 raw key，格式为 `x'<64hex_enc_key><32hex_salt>'`。三个平台均可通过扫描进程内存匹配此模式，再通过 HMAC 校验 page 1 确认密钥正确性。
+
+### GUI 工具箱 & 单 exe 打包
+
+提供 tkinter 图形界面 (`app_gui.py`)，集成核心功能：
+
+1. **解密数据库** — 调用 `main.py decrypt`
+2. **导出消息** — 调用 `export_messages.py`，输出 CSV / HTML / JSON
+3. **转换音频** — 调用 `voice_to_mp3.py`，SILK_V3 → MP3
+4. **企业微信解密** — 调用 `find_wxwork_keys.py` + `decrypt_wxwork_db.py`
+5. **企业微信导出** — 调用 `export_wxwork_messages.py`，按个人/群导出 CSV / HTML / JSON
+
+#### 直接运行
+
+```bash
+python app_gui.py
+```
+
+#### 打包为单 exe
+
+```bash
+pip install pyinstaller
+build.bat
+```
+
+输出 `dist\WeChatDecrypt.exe`（约 18MB），双击即可使用，无需安装 Python。
+
+> 转换音频需要系统安装 [FFmpeg](https://ffmpeg.org/download.html) 并加入 PATH。
+
+详细说明见 [EXE_USAGE.md](EXE_USAGE.md)。
 
 ### WAL 处理
 
@@ -325,7 +364,50 @@ WCDB (微信的 SQLCipher 封装) 会在进程内存中缓存派生后的 raw ke
 
 </details>
 
-### 免责声明
+### 企业微信数据库解密 (实验)
+
+企业微信 Windows 5.x 的本地数据库不是普通微信 SQLCipher 4 格式，而是 wxSQLite3 AES-128-CBC：
+
+- 16 字节 raw key
+- 每页按 page index + `sAlT` 派生 AES key
+- 每页 IV 由 page index 派生
+- 无 SQLCipher HMAC / reserve 区
+
+提取并解密：
+
+```bash
+python find_wxwork_keys.py
+python decrypt_wxwork_db.py
+python export_wxwork_messages.py
+```
+
+如果自动提取失败但你已有 raw key，也可以直接传入 32 位 hex key：
+
+```bash
+python decrypt_wxwork_db.py --key 00112233445566778899aabbccddeeff
+```
+
+配置项：
+
+```json
+{
+    "wxwork_db_dir": "C:\\Users\\<用户>\\Documents\\WXWork\\<account_id>\\Data",
+    "wxwork_keys_file": "wxwork_keys.json",
+    "wxwork_decrypted_dir": "wxwork_decrypted",
+    "wxwork_export_dir": "wxwork_export"
+}
+```
+
+### 数据库结构
+
+解密后包含约 26 个数据库：
+- `session/session.db` - 会话列表 (最新消息摘要)
+- `message/message_*.db` - 聊天记录
+- `contact/contact.db` - 联系人
+- `media_*/media_*.db` - 媒体文件索引
+- 其他: head_image, favorite, sns, emoticon 等
+
+## 免责声明
 
 本工具仅用于学习和研究目的，用于解密**自己的**微信数据。请遵守相关法律法规，不要用于未经授权的数据访问。
 

@@ -2,3 +2,5 @@ pycryptodome>=3.19,<4
 zstandard>=0.22,<1
 mcp>=1.0,<2
 # 可选：进度条 (pip install tqdm)
+pilk>=0.2
+pyinstaller>=6.0

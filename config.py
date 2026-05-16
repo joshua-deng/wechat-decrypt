@@ -10,6 +10,18 @@ import sys
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+# 打包后 __file__ 指向临时目录，优先使用环境变量或 cwd
+def _app_base_dir():
+    d = os.environ.get("WECHAT_DECRYPT_APP_DIR")
+    if d and os.path.isdir(d):
+        return d
+    return os.path.dirname(os.path.abspath(__file__))
+def _config_file_path():
+    base = _app_base_dir()
+    p = os.path.join(base, "config.json")
+    if os.path.exists(p):
+        return p
+    return CONFIG_FILE
 _SYSTEM = platform.system().lower()
 
 if _SYSTEM == "linux":
@@ -36,6 +48,11 @@ _DEFAULT = {
     "transcription_backend": "local",
     "local_whisper_model": "base",
     "openai_api_key": "",
+    "wxwork_db_dir": "",
+    "wxwork_keys_file": "wxwork_keys.json",
+    "wxwork_decrypted_dir": "wxwork_decrypted",
+    "wxwork_export_dir": "wxwork_export",
+    "wxwork_process": "WXWork.exe",
 }
 
 
@@ -210,12 +227,13 @@ def auto_detect_db_dir():
 
 def load_config():
     cfg = {}
-    if os.path.exists(CONFIG_FILE):
+    config_file = _config_file_path()
+    if os.path.exists(config_file):
         try:
-            with open(CONFIG_FILE, encoding="utf-8") as f:
+            with open(config_file, encoding="utf-8") as f:
                 cfg = json.load(f)
         except json.JSONDecodeError:
-            print(f"[!] {CONFIG_FILE} 格式损坏，将使用默认配置")
+            print(f"[!] {config_file} 格式损坏，将使用默认配置")
             cfg = {}
     # db_dir 缺失或仍为模板值时，尝试自动检测
     db_dir = cfg.get("db_dir", "")
@@ -224,15 +242,15 @@ def load_config():
         if detected:
             print(f"[+] 自动检测到微信数据目录: {detected}")
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(config_file, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
-            print(f"[+] 已保存到: {CONFIG_FILE}")
+            print(f"[+] 已保存到: {config_file}")
         else:
-            if not os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            if not os.path.exists(config_file):
+                with open(config_file, "w", encoding="utf-8") as f:
                     json.dump(_DEFAULT, f, indent=4, ensure_ascii=False)
             print(f"[!] 未能自动检测微信数据目录")
-            print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
+            print(f"    请手动编辑 {config_file} 中的 db_dir 字段")
             if _SYSTEM == "linux":
                 print("    Linux 默认路径类似: ~/Documents/xwechat_files/<wxid>/db_storage")
             elif _SYSTEM == "darwin":
@@ -248,10 +266,13 @@ def load_config():
     # "all_keys.json"(项目根相对),也能写 "~/Documents/wechat_decrypted" /
     # "$HOME/wechat" / "%USERPROFILE%\\wechat"(跨用户便携)。
     # 空字串 / null 不再触发 TypeError(用 cfg.get 而非 in)。
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = _app_base_dir()
     if cfg.get("db_dir"):
         cfg["db_dir"] = os.path.expanduser(os.path.expandvars(cfg["db_dir"]))
-    for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
+    for key in (
+        "keys_file", "decrypted_dir", "decoded_image_dir",
+        "wxwork_keys_file", "wxwork_decrypted_dir", "wxwork_export_dir",
+    ):
         if cfg.get(key):
             cfg[key] = os.path.expanduser(os.path.expandvars(cfg[key]))
             if not os.path.isabs(cfg[key]):
@@ -266,8 +287,34 @@ def load_config():
     else:
         cfg["wechat_base_dir"] = db_dir
 
+    # 输出目录：<app_dir>/wechat_files/<wxid>/
+    wxid = os.path.basename(os.path.normpath(cfg["wechat_base_dir"]))
+    cfg["output_base_dir"] = os.path.join(base, "wechat_files", wxid)
+
     # decoded_image_dir 默认值
     if "decoded_image_dir" not in cfg:
         cfg["decoded_image_dir"] = os.path.join(base, "decoded_images")
+
+    # 自动检测 WeChat Files 目录（FileStorage/MsgAttach, FileStorage/Sns/Cache）
+    if not cfg.get("wechat_files_dir"):
+        wechat_files_base = os.path.join(os.path.expanduser("~"), "Documents", "WeChat Files")
+        if os.path.isdir(wechat_files_base):
+            # xwechat_files 的 wxid 可能带后缀如 _1d4c，需要模糊匹配
+            wxid_prefix = wxid.rsplit("_", 1)[0] if "_" in wxid else wxid
+            for d in os.listdir(wechat_files_base):
+                if d == wxid or d == wxid_prefix or wxid.startswith(d):
+                    candidate = os.path.join(wechat_files_base, d)
+                    if os.path.isdir(os.path.join(candidate, "FileStorage")):
+                        cfg["wechat_files_dir"] = candidate
+                        break
+
+    wf_dir = cfg.get("wechat_files_dir", "")
+    cfg["msgattach_dir"] = os.path.join(wf_dir, "FileStorage", "MsgAttach") if wf_dir else ""
+    cfg["sns_cache_dir"] = os.path.join(wf_dir, "FileStorage", "Sns", "Cache") if wf_dir else ""
+
+    # xwechat_files 图片/缓存路径
+    wb = cfg["wechat_base_dir"]
+    cfg["xwechat_attach_dir"] = os.path.join(wb, "msg", "attach") if wb else ""
+    cfg["xwechat_cache_dir"] = os.path.join(wb, "cache") if wb else ""
 
     return cfg
