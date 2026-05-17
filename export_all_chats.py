@@ -10,9 +10,6 @@ transcription_backend 为 whisper_cpp / openai / local）。未启用 backend
 
 用法:
     python3 export_all_chats.py                         # 全量导出所有会话
-    python3 export_all_chats.py --list-chats            # 只列出会话清单
-    python3 export_all_chats.py --select                # 交互选择会话后导出
-    python3 export_all_chats.py --chats "1,3-5,张三"     # 按编号/范围/关键词导出
     python3 export_all_chats.py --write-plan-csv export_plan.csv
     python3 export_all_chats.py output_dir --from-plan-csv export_plan.csv
     python3 export_all_chats.py --with-transcriptions   # 全量导出 + 转录语音
@@ -407,66 +404,6 @@ def _build_chat_rows(sessions, names, contact_full=None):
     return rows
 
 
-def _print_chat_rows(rows):
-    for row in rows:
-        print(
-            f"[{row['index']}] {row['kind']:<6} "
-            f"{row['display_name']} ({row['username']})"
-        )
-
-
-def _select_chat_usernames(rows, selection):
-    """按编号、编号范围或显示名/username 模糊匹配选择会话。"""
-    if isinstance(selection, (list, tuple)):
-        selection = ",".join(str(part) for part in selection)
-    tokens = [part.strip() for part in str(selection).split(",") if part.strip()]
-    if not tokens:
-        return []
-
-    by_index = {row["index"]: row for row in rows}
-    selected = []
-    seen = set()
-
-    def add(row):
-        username = row["username"]
-        if username not in seen:
-            selected.append(username)
-            seen.add(username)
-
-    for token in tokens:
-        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
-        if range_match:
-            start, end = (int(range_match.group(1)), int(range_match.group(2)))
-            if start > end:
-                raise ValueError(f"无效范围: {token}")
-            missing = [idx for idx in range(start, end + 1) if idx not in by_index]
-            if missing:
-                raise ValueError(f"会话编号不存在: {missing[0]}")
-            for idx in range(start, end + 1):
-                add(by_index[idx])
-            continue
-
-        if token.isdigit():
-            index = int(token)
-            if index not in by_index:
-                raise ValueError(f"会话编号不存在: {index}")
-            add(by_index[index])
-            continue
-
-        needle = token.casefold()
-        matches = [
-            row for row in rows
-            if needle in str(row["display_name"]).casefold()
-            or needle in str(row["username"]).casefold()
-        ]
-        if not matches:
-            raise ValueError(f"没有匹配的会话: {token}")
-        for row in matches:
-            add(row)
-
-    return selected
-
-
 def _format_plan_time(ts):
     if not ts:
         return ""
@@ -494,7 +431,6 @@ def _contact_metadata_for_export(username, is_group=False):
     return {
         "contact_remark": contact.get("remark", ""),
         "contact_nick_name": contact.get("nick_name", ""),
-        "contact_phone": contact.get("phone", ""),
         "contact_tags": tag_map.get(username, []),
         "contact_memo": contact.get("description", ""),
     }
@@ -1227,11 +1163,12 @@ def export_one(username, output_dir, names, transcribe=False,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "date_first_msg": _date_from_message_ts(messages[0].get("timestamp")),
         "date_last_msg": _date_from_message_ts(messages[-1].get("timestamp")),
-        "messages": messages,
     }
     if ctx["is_group"]:
         output["is_group"] = True
-    output.update(_contact_metadata_for_export(username, ctx["is_group"]))
+    else:
+        output.update(_contact_metadata_for_export(username, ctx["is_group"]))
+    output["messages"] = messages
 
     os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1265,9 +1202,6 @@ def main(argv=None):
         epilog="""
 示例:
     python3 export_all_chats.py                           全量导出所有会话
-    python3 export_all_chats.py --list-chats              只列出所有会话，不写文件
-    python3 export_all_chats.py --select                  列表后交互选择会话
-    python3 export_all_chats.py --chats "1,3-5,张三"       按编号/范围/关键词导出
     python3 export_all_chats.py --write-plan-csv export_plan.csv
     python3 export_all_chats.py --write-plan-csv export_plan.csv --plan-mode whitelist
     python3 export_all_chats.py --write-plan-csv export_plan.csv --size-mode scan
@@ -1291,21 +1225,6 @@ def main(argv=None):
         "--with-transcriptions",
         action="store_true",
         help="导出时一并转录语音消息（依赖 config.json 配置的 backend）",
-    )
-    parser.add_argument(
-        "--list-chats",
-        action="store_true",
-        help="只列出所有会话编号、类型、名称和 username，不导出",
-    )
-    parser.add_argument(
-        "--select",
-        action="store_true",
-        help="先列出会话，再交互输入编号/范围/关键词选择导出",
-    )
-    parser.add_argument(
-        "--chats",
-        default=None,
-        help="只导出匹配的会话，支持编号、范围、显示名或 username，逗号分隔",
     )
     parser.add_argument(
         "--write-plan-csv",
@@ -1361,14 +1280,8 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    if args.select and args.chats:
-        parser.error("--select 和 --chats 只能使用一个")
     if args.write_plan_csv and args.from_plan_csv:
         parser.error("--write-plan-csv 和 --from-plan-csv 只能使用一个")
-    if args.from_plan_csv and (args.select or args.chats):
-        parser.error("--from-plan-csv 不能与 --select/--chats 同时使用")
-    if args.write_plan_csv and (args.select or args.chats or args.list_chats):
-        parser.error("--write-plan-csv 不能与 --list-chats/--select/--chats 同时使用")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = args.output_dir or os.path.join(script_dir, "exported_chats")
@@ -1440,10 +1353,6 @@ def main(argv=None):
     print(f"模式: {mode}")
     print("=" * 60)
 
-    if args.list_chats:
-        _print_chat_rows(chat_rows)
-        return
-
     if args.write_plan_csv:
         rows = _build_plan_csv_rows(
             chat_rows,
@@ -1467,25 +1376,7 @@ def main(argv=None):
             print("黑名单模式：请将不导出的行改为 export=0，再使用 --from-plan-csv 导出。")
         return
 
-    if args.select:
-        _print_chat_rows(chat_rows)
-        print("=" * 60)
-        selection = input("请输入要导出的编号/范围/关键词（逗号分隔，直接回车取消）: ")
-        if not selection.strip():
-            print("未选择任何会话，已取消。")
-            return
-        try:
-            sessions = _select_chat_usernames(chat_rows, selection)
-        except ValueError as e:
-            print(f"选择失败: {e}", file=sys.stderr)
-            sys.exit(1)
-    elif args.chats:
-        try:
-            sessions = _select_chat_usernames(chat_rows, args.chats)
-        except ValueError as e:
-            print(f"选择失败: {e}", file=sys.stderr)
-            sys.exit(1)
-    elif args.from_plan_csv:
+    if args.from_plan_csv:
         try:
             sessions = _load_selected_usernames_from_plan_csv(
                 args.from_plan_csv,
@@ -1499,11 +1390,8 @@ def main(argv=None):
             print("未选择任何会话，已取消。")
             return
 
-    if args.chats or args.select or args.from_plan_csv:
-        row_by_username = {row["username"]: row for row in chat_rows}
-        selected_rows = [row_by_username[u] for u in sessions if u in row_by_username]
+    if args.from_plan_csv:
         print(f"本次选择: {len(sessions)} 个会话")
-        _print_chat_rows(selected_rows)
         print("=" * 60)
 
     if args.dry_run:

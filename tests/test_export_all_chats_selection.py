@@ -12,7 +12,7 @@ from unittest.mock import patch
 import export_all_chats
 
 
-class ChatSelectionTests(unittest.TestCase):
+class ChatRowsTests(unittest.TestCase):
     def setUp(self):
         self.rows = export_all_chats._build_chat_rows(
             ["wxid_alice", "12345@chatroom", "wxid_bob"],
@@ -30,20 +30,6 @@ class ChatSelectionTests(unittest.TestCase):
             ],
         )
 
-    def test_selects_by_index_range_and_text_match(self):
-        selected = export_all_chats._select_chat_usernames(
-            self.rows, "2,1-1,bob"
-        )
-
-        self.assertEqual(
-            selected,
-            ["12345@chatroom", "wxid_alice", "wxid_bob"],
-        )
-
-    def test_rejects_unknown_selection_token(self):
-        with self.assertRaisesRegex(ValueError, "没有匹配"):
-            export_all_chats._select_chat_usernames(self.rows, "nobody")
-
     def test_chat_rows_include_contact_remark_and_nickname(self):
         self.assertEqual(self.rows[0]["remark"], "Alice Remark")
         self.assertEqual(self.rows[0]["nick_name"], "Alice Nick")
@@ -51,7 +37,7 @@ class ChatSelectionTests(unittest.TestCase):
         self.assertEqual(self.rows[1]["nick_name"], "")
 
 
-class ExportAllChatsCliSelectionTests(unittest.TestCase):
+class ExportAllChatsCliCsvOnlyTests(unittest.TestCase):
     def _run_main(self, argv):
         with patch.object(export_all_chats.mcp_server, "DECRYPTED_DIR", "decrypted"), \
              patch.object(export_all_chats.os.path, "exists", return_value=True), \
@@ -71,25 +57,33 @@ class ExportAllChatsCliSelectionTests(unittest.TestCase):
                 export_all_chats.main(argv)
             return out.getvalue(), export_one
 
-    def test_list_chats_prints_choices_without_exporting(self):
-        output, export_one = self._run_main(["--list-chats"])
-
-        self.assertIn("[1] single Alice", output)
-        self.assertIn("[2] group  Project Group", output)
-        export_one.assert_not_called()
+    def test_direct_selection_args_are_not_supported(self):
+        for argv in (["--list-chats"], ["--select"], ["--chats", "Alice"]):
+            with self.subTest(argv=argv), \
+                 patch.object(export_all_chats.mcp_server, "DECRYPTED_DIR", "decrypted"), \
+                 patch.object(export_all_chats.os.path, "exists", return_value=True), \
+                 patch.object(export_all_chats, "_load_session_usernames",
+                              return_value=["wxid_alice", "12345@chatroom"]), \
+                 patch.object(export_all_chats.mcp_server, "get_contact_names",
+                              return_value={
+                                  "wxid_alice": "Alice",
+                                  "12345@chatroom": "Project Group",
+                              }), \
+                 patch.object(export_all_chats.mcp_server, "get_contact_full",
+                              return_value=[]), \
+                 patch("builtins.input", return_value=""), \
+                 redirect_stdout(io.StringIO()), \
+                 redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    export_all_chats.main(argv)
+                self.assertEqual(cm.exception.code, 2)
 
     def test_dry_run_does_not_export(self):
-        output, export_one = self._run_main(["--dry-run", "--chats", "Alice"])
+        output, export_one = self._run_main(["--dry-run", "--users", "wxid_alice"])
 
         self.assertIn("预览", output)
-        self.assertIn("Alice", output)
+        self.assertIn("会话总数: 1", output)
         export_one.assert_not_called()
-
-    def test_chats_limits_export_scope(self):
-        _, export_one = self._run_main(["--chats", "Project"])
-
-        export_one.assert_called_once()
-        self.assertEqual(export_one.call_args.args[0], "12345@chatroom")
 
 
 class ExportPlanCsvTests(unittest.TestCase):
@@ -432,7 +426,7 @@ class ExportAllChatsCliPlanCsvTests(unittest.TestCase):
                         tmp, "--from-plan-csv", plan, "--dry-run"
                     ])
 
-            self.assertIn("Alice", out.getvalue())
+            self.assertIn("本次选择: 1 个会话", out.getvalue())
             export_one.assert_not_called()
 
 
@@ -479,11 +473,29 @@ class ExportOneMetadataTests(unittest.TestCase):
 
         self.assertEqual(data["contact_remark"], "张三备注")
         self.assertEqual(data["contact_nick_name"], "张三昵称")
-        self.assertEqual(data["contact_phone"], "13800000000")
+        self.assertNotIn("contact_phone", data)
         self.assertEqual(data["contact_tags"], ["客户", "北京"])
         self.assertEqual(data["contact_memo"], "重要客户")
         self.assertEqual(data["date_first_msg"], "2026-05-01 08:00:00")
         self.assertEqual(data["date_last_msg"], "2026-05-01 08:01:00")
+        self.assertEqual(
+            list(data.keys())[:9],
+            [
+                "chat",
+                "username",
+                "exported_at",
+                "date_first_msg",
+                "date_last_msg",
+                "contact_remark",
+                "contact_nick_name",
+                "contact_tags",
+                "contact_memo",
+            ],
+        )
+        self.assertLess(
+            list(data.keys()).index("contact_memo"),
+            list(data.keys()).index("messages"),
+        )
 
 
 class ExportIndexTests(unittest.TestCase):

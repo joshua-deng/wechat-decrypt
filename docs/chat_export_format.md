@@ -31,7 +31,6 @@
   "date_last_msg": "YYYY-MM-DD HH:MM:SS",
   "contact_remark": "<remark>",
   "contact_nick_name": "<nick name>",
-  "contact_phone": "<phone>",
   "contact_tags": ["<tag>"],
   "contact_memo": "<memo>",
   "is_group": true,
@@ -44,8 +43,8 @@
   `transcribe_chat.py` 会优先读取本字段而非基于 `chat` 再次模糊匹配，避免同名联系人漂移。
 - `exported_at` —— 本地时间字符串，仅作溯源用途。
 - `date_first_msg` / `date_last_msg` —— 本次导出结果中第一条 / 最后一条消息的本地时间。
-- `contact_remark`、`contact_nick_name`、`contact_phone`、`contact_tags`、`contact_memo` ——
-  单聊联系人 metadata；群聊中省略。若当前微信数据库没有电话字段，`contact_phone` 为空串。
+- `contact_remark`、`contact_nick_name`、`contact_tags`、`contact_memo` ——
+  单聊联系人 metadata；群聊中省略。
 - `is_group` —— **仅**群聊出现且为 `true`；1-on-1 聊天时省略。
 - `messages` —— 消息数组，跨所有 DB 分片按时间由旧到新排序。
 
