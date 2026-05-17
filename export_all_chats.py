@@ -935,7 +935,7 @@ def _build_plan_csv_rows(chat_rows, start_ts=None, end_ts=None, size_mode="estim
         username = row["username"]
         stats = stats_by_username[username]
         rows.append({
-            "export": "0",
+            "export": "",
             "index": row["index"],
             "username": username,
             "chat_name": row["display_name"],
@@ -968,10 +968,6 @@ def _write_plan_csv(path, rows, plan_mode=PLAN_MODE_BLACKLIST):
         for row in rows:
             full = {field: "" for field in PLAN_CSV_FIELDS}
             full.update(row)
-            if full["export"] == "":
-                full["export"] = (
-                    "0" if plan_mode == PLAN_MODE_WHITELIST else "1"
-                )
             writer.writerow(full)
 
 

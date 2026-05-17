@@ -87,7 +87,7 @@ class ExportAllChatsCliCsvOnlyTests(unittest.TestCase):
 
 
 class ExportPlanCsvTests(unittest.TestCase):
-    def test_writes_utf8_sig_csv_without_contact_remark_or_nickname(self):
+    def test_writes_utf8_sig_csv_with_blank_export_by_default(self):
         row = {
             "index": 1,
             "username": "wxid_alice",
@@ -111,12 +111,12 @@ class ExportPlanCsvTests(unittest.TestCase):
             with open(path, newline="", encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(export_all_chats.PLAN_CSV_FIELDS, list(rows[0].keys()))
-            self.assertEqual(rows[0]["export"], "1")
+            self.assertEqual(rows[0]["export"], "")
             self.assertEqual(rows[0]["chat_name"], '张三, "A"')
             self.assertNotIn("contact_remark", rows[0])
             self.assertNotIn("contact_nick_name", rows[0])
 
-    def test_whitelist_plan_csv_defaults_to_export_zero(self):
+    def test_whitelist_plan_csv_also_defaults_to_blank_export(self):
         row = {
             "index": 1,
             "username": "wxid_alice",
@@ -140,7 +140,7 @@ class ExportPlanCsvTests(unittest.TestCase):
             with open(path, newline="", encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
 
-        self.assertEqual(rows[0]["export"], "0")
+        self.assertEqual(rows[0]["export"], "")
 
     def test_loads_all_rows_except_explicit_export_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,11 +285,47 @@ class ExportPlanStatsTests(unittest.TestCase):
                           side_effect=AssertionError("per-chat lookup too slow")):
             rows = export_all_chats._build_plan_csv_rows(chat_rows)
 
+        self.assertEqual(rows[0]["export"], "")
         self.assertEqual(rows[0]["username"], "wxid_alice")
         self.assertNotIn("contact_remark", rows[0])
         self.assertNotIn("contact_nick_name", rows[0])
         self.assertEqual(rows[0]["message_count"], 2)
         self.assertEqual(rows[0]["total_estimated_bytes"], 16)
+
+    def test_build_and_write_plan_keeps_export_blank_in_default_blacklist_mode(self):
+        chat_rows = [
+            {
+                "index": 1,
+                "username": "wxid_alice",
+                "display_name": "Alice",
+                "kind": "single",
+                "remark": "",
+                "nick_name": "",
+            }
+        ]
+        stats = {
+            "wxid_alice": {
+                "message_count": 1,
+                "message_body_bytes": 4,
+                "first_time": "2026-01-01 00:00:00",
+                "last_time": "2026-01-01 00:00:00",
+                "attachment_estimated_bytes": 0,
+                "attachment_scanned_bytes": "",
+                "total_estimated_bytes": 4,
+                "size_status": "ok",
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "plan.csv")
+            with patch.object(export_all_chats, "_collect_all_plan_stats",
+                              return_value=stats):
+                rows = export_all_chats._build_plan_csv_rows(chat_rows)
+                export_all_chats._write_plan_csv(path, rows)
+
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                csv_rows = list(csv.DictReader(f))
+
+        self.assertEqual(csv_rows[0]["export"], "")
 
 
 class ExportAllChatsCliPlanCsvTests(unittest.TestCase):
