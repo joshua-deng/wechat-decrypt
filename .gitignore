@@ -399,6 +399,7 @@ decoded_voices/
 voice_transcriptions.json
 data/
 export/
+export_plan*.csv
 build/
 dist/
 decrypted/
