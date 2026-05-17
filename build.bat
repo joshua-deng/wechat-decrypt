@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ========================================
-echo   WeChatDecrypt 打包脚本 (Web UI 版)
+echo   WeChatDecrypt 打包脚本 (Web UI + CLI 双模式)
 echo ========================================
 echo.
 
@@ -32,6 +32,7 @@ for %%F in (dist\WeChatDecrypt.exe) do echo   大小: %%~zF bytes
 echo.
 echo   使用: 双击 WeChatDecrypt.exe
 echo   ^→ 自动启动浏览器到 http://localhost:5678 (Web UI)
+echo   CLI: WeChatDecrypt.exe --help
 echo ========================================
 echo.
 pause

@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
 import zstandard as zstd
+from config import _config_file_path, _DEFAULT
 from decode_image import ImageResolver
 from key_utils import get_key_info, key_path_variants, strip_key_metadata
 
@@ -30,13 +31,16 @@ WAL_FRAME_HEADER_SZ = 24
 
 # ============ 配置加载 ============
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+CONFIG_FILE = _config_file_path()
 
-with open(CONFIG_FILE, encoding="utf-8") as f:
-    _cfg = json.load(f)
+try:
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        _cfg = json.load(f)
+except FileNotFoundError:
+    _cfg = dict(_DEFAULT)
 for _key in ("keys_file", "decrypted_dir"):
     if _key in _cfg and not os.path.isabs(_cfg[_key]):
-        _cfg[_key] = os.path.join(SCRIPT_DIR, _cfg[_key])
+        _cfg[_key] = os.path.join(os.path.dirname(CONFIG_FILE), _cfg[_key])
 
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -55,8 +59,11 @@ if not DECODED_IMAGE_DIR:
 elif not os.path.isabs(DECODED_IMAGE_DIR):
     DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, DECODED_IMAGE_DIR)
 
-with open(KEYS_FILE, encoding="utf-8") as f:
-    ALL_KEYS = strip_key_metadata(json.load(f))
+try:
+    with open(KEYS_FILE, encoding="utf-8") as f:
+        ALL_KEYS = strip_key_metadata(json.load(f))
+except FileNotFoundError:
+    ALL_KEYS = {}
 
 # ============ 解密函数 ============
 

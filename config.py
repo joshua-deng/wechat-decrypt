@@ -10,18 +10,23 @@ import sys
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# 打包后 __file__ 指向临时目录，优先使用环境变量或5 cwd
+# 打包后 __file__ 指向临时目录，优先使用环境变量指定的 exe 所在目录。
 def _app_base_dir():
     d = os.environ.get("WECHAT_DECRYPT_APP_DIR")
     if d and os.path.isdir(d):
         return d
     return os.path.dirname(os.path.abspath(__file__))
+
+
 def _config_file_path():
-    base = _app_base_dir()
-    p = os.path.join(base, "config.json")
+    if os.environ.get("WECHAT_DECRYPT_APP_DIR"):
+        return os.path.join(_app_base_dir(), "config.json")
+    p = os.path.join(_app_base_dir(), "config.json")
     if os.path.exists(p):
         return p
     return CONFIG_FILE
+
+
 _SYSTEM = platform.system().lower()
 
 if _SYSTEM == "linux":
@@ -278,7 +283,7 @@ def load_config():
     # "all_keys.json"(项目根相对),也能写 "~/Documents/wechat_decrypted" /
     # "$HOME/wechat" / "%USERPROFILE%\\wechat"(跨用户便携)。
     # 空字串 / null 不再触发 TypeError(用 cfg.get 而非 in)。
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = _app_base_dir()
     if cfg.get("db_dir"):
         cfg["db_dir"] = os.path.expanduser(os.path.expandvars(cfg["db_dir"]))
     for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):

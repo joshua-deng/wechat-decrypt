@@ -517,8 +517,19 @@ build.bat                    # → dist\WeChatDecrypt.exe (~20MB)
 ```
 
 **单 exe 默认入口是 Web UI** (双击 → 自动开浏览器), 因为 Web UI 体验更好。
-要打包成 tkinter 入口的话改 `WeChatDecrypt.spec` 里的 `Analysis(['monitor_web.py'])`
-为 `Analysis(['app_gui.py'])` 再 `build.bat`。
+同一个 exe 也支持 CLI 子命令:
+
+```powershell
+.\WeChatDecrypt.exe --help
+.\WeChatDecrypt.exe status
+.\WeChatDecrypt.exe decrypt
+.\WeChatDecrypt.exe export --from-plan-csv export_plan.csv
+.\WeChatDecrypt.exe export-all --write-plan-csv export_plan.csv
+```
+
+要打包成 tkinter 入口的话改 `WeChatDecrypt.spec` 里的
+`Analysis(['wechat_decrypt_launcher.py'])` 为 `Analysis(['app_gui.py'])`
+再 `build.bat`。
 
 > 语音转 MP3 需要系统安装 [FFmpeg](https://ffmpeg.org/download.html) 并加入 PATH。
 

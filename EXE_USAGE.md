@@ -1,4 +1,4 @@
-# WeChatDecrypt 使用说明 (Web UI 版)
+# WeChatDecrypt 使用说明 (Web UI + CLI 双模式)
 
 ## 快速开始
 
@@ -6,6 +6,25 @@
 2. **双击 `WeChatDecrypt.exe`**
 3. 浏览器**自动打开** `http://localhost:5678` (没自动开就手动复制粘贴)
 4. 右上角点 **🛠️ 工具** 展开工具箱, 按 tab 切到你要的板块
+
+## CLI 用法
+
+同一个 `WeChatDecrypt.exe` 带参数运行时会作为命令行入口:
+
+```powershell
+.\WeChatDecrypt.exe --help
+.\WeChatDecrypt.exe status
+.\WeChatDecrypt.exe decrypt
+.\WeChatDecrypt.exe export --from-plan-csv export_plan.csv
+.\WeChatDecrypt.exe export-all --write-plan-csv export_plan.csv
+```
+
+无参数或 `web` 子命令仍启动 Web UI:
+
+```powershell
+.\WeChatDecrypt.exe
+.\WeChatDecrypt.exe web
+```
 
 ## 工具箱 3 个 tab
 
@@ -101,6 +120,6 @@ python app_gui.py        # → 弹 tkinter 窗口
 - Windows-only (不跨平台)
 - 没法远程访问
 
-单 exe **默认入口是 Web UI**。要打 tkinter 版的 exe, 改
-`WeChatDecrypt.spec` 里 `Analysis(['monitor_web.py'])` 为
+单 exe **默认入口是 Web UI + CLI 分发器**。要打 tkinter 版的 exe, 改
+`WeChatDecrypt.spec` 里 `Analysis(['wechat_decrypt_launcher.py'])` 为
 `Analysis(['app_gui.py'])` 再 `build.bat`。
