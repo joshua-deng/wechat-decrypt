@@ -315,19 +315,20 @@ def main():
         print("[*] 开始解密全部数据库...")
         print()
         from decrypt_db import main as decrypt_all
-        _call_with_argv(decrypt_all, ["decrypt_db.py", *sys.argv[2:]])
+        decrypt_all(sys.argv[2:])
 
     elif cmd in ("export", "all"):
         print("[*] 开始解密全部数据库...")
         print()
         from decrypt_db import main as decrypt_all
-        _call_with_argv(decrypt_all, ["decrypt_db.py"])
+        decrypt_all([])
         print()
         print("[*] 开始批量导出聊天记录...")
         print()
         from export_all_chats import main as export_all
         try:
-            _call_with_argv(export_all, ["export_all_chats.py"])
+            export_args = sys.argv[2:] if cmd == "export" else []
+            export_all(export_args)
         except SystemExit:
             pass
 

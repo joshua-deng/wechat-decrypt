@@ -106,7 +106,7 @@ def decrypt_database(db_path, out_path, enc_key):
     return True
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="WeChat 4.0 数据库解密器"
     )
@@ -120,7 +120,7 @@ def main():
         action="store_true",
         help="预览模式：显示将要解密的数据库列表",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     print("=" * 60)
     print("  WeChat 4.0 数据库解密器")

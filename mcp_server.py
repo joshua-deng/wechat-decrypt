@@ -222,7 +222,7 @@ atexit.register(_cache.cleanup)
 # ============ 联系人缓存 ============
 
 _contact_names = None  # {username: display_name}
-_contact_full = None   # [{username, nick_name, remark}]
+_contact_full = None   # [{username, nick_name, remark, alias, description, phone}]
 _contact_tags = None   # {label_id: {name, sort_order, members: [{username, display_name}]}}
 _self_username = None
 _contact_db_mtime = 0  # mtime of the decrypted contact.db when caches were last populated
@@ -245,11 +245,47 @@ def _load_contacts_from(db_path):
     full = []
     conn = sqlite3.connect(db_path)
     try:
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
-            uname, nick, remark = r
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(contact)").fetchall()
+        }
+        optional_columns = {
+            "alias": "",
+            "description": "",
+            "phone": "",
+            "phone_number": "",
+            "mobile": "",
+            "mobile_phone": "",
+            "telephone": "",
+        }
+        select_columns = ["username", "nick_name", "remark"]
+        select_columns.extend(
+            col for col in optional_columns
+            if col in columns and col not in select_columns
+        )
+        rows = conn.execute(
+            "SELECT " + ", ".join(f"[{col}]" for col in select_columns)
+            + " FROM contact"
+        ).fetchall()
+        for r in rows:
+            data = dict(zip(select_columns, r))
+            uname = data.get("username")
+            nick = data.get("nick_name")
+            remark = data.get("remark")
             display = remark if remark else nick if nick else uname
             names[uname] = display
-            full.append({'username': uname, 'nick_name': nick or '', 'remark': remark or ''})
+            phone = ""
+            for col in ("phone", "phone_number", "mobile", "mobile_phone", "telephone"):
+                if data.get(col):
+                    phone = data.get(col) or ""
+                    break
+            full.append({
+                'username': uname,
+                'nick_name': nick or '',
+                'remark': remark or '',
+                'alias': data.get("alias") or '',
+                'description': data.get("description") or '',
+                'phone': phone,
+            })
     finally:
         conn.close()
     return names, full
@@ -304,6 +340,20 @@ def get_contact_names():
 def get_contact_full():
     get_contact_names()
     return _contact_full or []
+
+
+def get_contact_tag_names_by_username():
+    tags = _load_contact_tags()
+    by_username = {}
+    for tag in tags.values():
+        name = tag.get('name') or ''
+        if not name:
+            continue
+        for member in tag.get('members', []):
+            username = member.get('username')
+            if username:
+                by_username.setdefault(username, []).append(name)
+    return by_username
 
 
 def _extract_pb_field_30(data):
