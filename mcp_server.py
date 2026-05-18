@@ -245,7 +245,7 @@ def _load_contacts_from(db_path):
     full = []
     conn = sqlite3.connect(db_path)
     try:
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
+        for r in conn.execute("SELECT username, nick_name, remark FROM contact WHERE local_type != 3").fetchall():
             uname, nick, remark = r
             display = remark if remark else nick if nick else uname
             names[uname] = display
